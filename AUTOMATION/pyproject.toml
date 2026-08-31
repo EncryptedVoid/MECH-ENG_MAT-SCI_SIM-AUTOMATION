@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lava"
+version = "0.4.0"
+description = "LAMMPS Automation Validation Aid - a tkinter wizard to set up and run LAMMPS simulation sessions."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Ashiq Arib Gazi" },
+    { name = "Kazi Rubaiyat Mustafix" },
+]
+
+# tkinter is intentionally omitted: it ships with CPython but is installed as a
+# system package (python3-tk) on Linux, not via pip. All deps below are
+# optional at runtime and degrade gracefully (see requirements.txt for detail).
+dependencies = [
+    "psutil>=5.9",
+    "Pillow>=10.0",
+    "matplotlib>=3.7",
+    "plotly>=5.0",
+]
+
+[project.scripts]
+lava = "run:main"
+
+# LAVA is a flat set of modules (run, helpers, report, constants), not a
+# package tree, so list them explicitly rather than auto-discovering.
+[tool.setuptools]
+py-modules = ["run", "helpers", "report", "constants"]
+
+# setup.sh, the logo, and docs are shipped alongside the modules.
+[tool.setuptools.data-files]
+"." = ["setup.sh"]

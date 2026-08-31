@@ -1,0 +1,86 @@
+# ===========================================================================
+#  ZnO VALIDATION - bulk wurtzite ZnO thermal conductivity (heat along Z)
+#  Buckingham + long-range Coulomb (PPPM), Langevin two-bath NEMD.
+#  Target: kappa_inf ~ 51 W/m/K  (Song et al. 2026, same potential)
+#
+#  Run:  lmp -in in.zno_kappa -var infile zno_L30.data -var seed 11111
+# ===========================================================================
+units           metal
+dimension       3
+boundary        p p p
+atom_style      charge
+
+read_data       ${infile}
+
+# Buckingham params: Song et al. ICHMT 2026 Table 1 / IJTS 2026 Table 1
+#   Zn-O: A=529.7 eV, rho=0.3581 A, C=0 ; O-O: A=9547.9, rho=0.2191, C=32.0
+#   Zn-Zn: zero (cation-cation neglected - standard for this potential family)
+# Formal charges Zn=+2, O=-2 are in the data file.
+pair_style      buck/coul/long 10.0
+pair_coeff      1 1 0.0     1.0     0.0
+pair_coeff      1 2 529.7   0.3581  0.0
+pair_coeff      2 2 9547.9  0.2191  32.0
+kspace_style    pppm 1.0e-5
+
+neighbor        2.0 bin
+neigh_modify    delay 0 every 1 check yes
+timestep        0.00025                 # 0.25 fs (matches reference papers)
+
+# ---------------- slab geometry along Z -----------------------------------
+variable        zL   equal zlo
+variable        zH   equal zhi
+variable        wall equal 6.0
+variable        bath equal 12.0
+variable        z1 equal ${zL}+${wall}
+variable        z2 equal ${z1}+${bath}
+variable        z4 equal ${zH}-${wall}
+variable        z3 equal ${z4}-${bath}
+
+region          rWL   block INF INF INF INF ${zL} ${z1} units box
+region          rWH   block INF INF INF INF ${z4} ${zH} units box
+region          rHOT  block INF INF INF INF ${z1} ${z2} units box
+region          rCOLD block INF INF INF INF ${z3} ${z4} units box
+
+group           gWL region rWL
+group           gWH region rWH
+group           walls union gWL gWH
+group           gHOT region rHOT
+group           gCOLD region rCOLD
+group           mobile subtract all walls
+
+velocity        all   create 300.0 ${seed} mom yes rot yes dist gaussian
+velocity        walls set 0.0 0.0 0.0
+fix             fw walls setforce 0.0 0.0 0.0
+
+fix             f1 mobile npt temp 300.0 300.0 0.05 aniso 0.0 0.0 0.5
+thermo          10000
+thermo_style    custom step temp press pe lx ly lz
+run             400000                  # 100 ps NPT
+unfix           f1
+fix             f2 mobile nvt temp 300.0 300.0 0.05
+run             400000                  # 100 ps NVT
+unfix           f2
+reset_timestep  0
+
+fix             f3 mobile nve
+fix             fhot  gHOT  langevin 320.0 320.0 0.1 ${seed} tally yes
+fix             fcold gCOLD langevin 280.0 280.0 0.1 ${seed} tally yes
+
+compute         ke all ke/atom
+variable        tatom atom c_ke/(1.5*8.617333262e-5)
+variable        nbins equal 40
+variable        binw  equal 1.0/${nbins}
+compute         cc mobile chunk/atom bin/1d z lower ${binw} units reduced
+fix             fp mobile ave/chunk 400 2000 800000 cc v_tatom file T_profile.dat
+
+variable        tps equal step*dt
+variable        eh  equal f_fhot
+variable        ec  equal f_fcold
+fix             fm all print 40000 "${tps} ${eh} ${ec}" file ebath.dat &
+                title "t_ps E_hot_eV E_cold_eV" screen no
+
+thermo          80000
+thermo_style    custom step temp f_fhot f_fcold
+run             8000000                 # 2 ns production
+
+print "DONE ZnO ${infile}"

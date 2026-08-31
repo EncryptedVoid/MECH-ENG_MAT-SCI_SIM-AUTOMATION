@@ -1,0 +1,19 @@
+# LAVA runtime dependencies.
+#
+# tkinter is NOT listed here: it ships with CPython but is a system package on
+# Linux (install with e.g. `sudo apt install python3-tk`), not a pip package.
+#
+# Everything below is optional and degrades gracefully if missing:
+#   psutil     - CPU/RAM sampling. Without it, a session cannot start (the GUI
+#                tells the user to install it). Required in practice for runs.
+#   Pillow     - loads the .webp/.jpg logo and window icon. Without it, LAVA
+#                falls back to a volcano glyph.
+#   matplotlib - backup PNG graphs at session end. Without it, PNGs are skipped
+#                (the interactive HTML report still generates).
+#   plotly     - only used as a local source for the offline Plotly JS bundle;
+#                if absent, the report fetches it from the CDN once and caches.
+
+psutil>=5.9
+Pillow>=10.0
+matplotlib>=3.7
+plotly>=5.0

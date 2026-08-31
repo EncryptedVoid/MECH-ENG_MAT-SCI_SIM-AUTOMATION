@@ -1,0 +1,203 @@
+LAMMPS (22 Jul 2025 - Update 5)
+OMP_NUM_THREADS environment is not set. Defaulting to 1 thread.
+  using 1 OpenMP thread(s) per MPI task
+# ===========================================================================
+#  BP VALIDATION - ARMCHAIR transport (heat flows along Y)
+#  Method: Langevin two-bath NEMD (same method as Song et al. ZnO/hBN papers)
+#  Everything is written EXPLICITLY - no runtime branching.
+#
+#  Run:  lmp -in in.bp_armchair -var infile bp_ac_W16_L50.data -var seed 11111
+# ===========================================================================
+units           metal
+dimension       3
+boundary        p p p
+atom_style      atomic
+
+read_data       ${infile}
+read_data       /home/userx/Documents/GITLAB/MECH-ENG_MAT-SCI_SIM-AUTOMATION/SIMULATION/STRUCTURE-FILES/bp_ac_W8_L50.data
+Reading data file ...
+  orthogonal box = (0 0 0) to (26.368 227.2 32.104598)
+  1 by 4 by 1 MPI processor grid
+  reading atoms ...
+  1600 atoms
+  read_data CPU = 0.004 seconds
+
+pair_style      sw
+pair_coeff      * * bp.sw B T          # type1 -> B (bottom), type2 -> T (top)
+
+neighbor        2.0 bin
+neigh_modify    delay 0 every 1 check yes
+timestep        0.0005                  # 0.5 fs
+
+# ---------------- slab geometry along Y -----------------------------------
+variable        xL      equal ylo
+variable        xH      equal yhi
+variable        wall    equal 6.0       # fixed wall thickness (A)
+variable        bath    equal 12.0      # reservoir thickness (A)
+variable        x1      equal ${xL}+${wall}
+variable        x1      equal 0+${wall}
+variable        x1      equal 0+6
+variable        x2      equal ${x1}+${bath}
+variable        x2      equal 6+${bath}
+variable        x2      equal 6+12
+variable        x4      equal ${xH}-${wall}
+variable        x4      equal 227.2-${wall}
+variable        x4      equal 227.2-6
+variable        x3      equal ${x4}-${bath}
+variable        x3      equal 221.2-${bath}
+variable        x3      equal 221.2-12
+
+region          rWL   block INF INF ${xL} ${x1} INF INF units box
+region          rWL   block INF INF 0 ${x1} INF INF units box
+region          rWL   block INF INF 0 6 INF INF units box
+region          rWH   block INF INF ${x4} ${xH} INF INF units box
+region          rWH   block INF INF 221.2 ${xH} INF INF units box
+region          rWH   block INF INF 221.2 227.2 INF INF units box
+region          rHOT  block INF INF ${x1} ${x2} INF INF units box
+region          rHOT  block INF INF 6 ${x2} INF INF units box
+region          rHOT  block INF INF 6 18 INF INF units box
+region          rCOLD block INF INF ${x3} ${x4} INF INF units box
+region          rCOLD block INF INF 209.2 ${x4} INF INF units box
+region          rCOLD block INF INF 209.2 221.2 INF INF units box
+
+group           gWL   region rWL
+40 atoms in group gWL
+group           gWH   region rWH
+40 atoms in group gWH
+group           walls union gWL gWH
+80 atoms in group walls
+group           gHOT  region rHOT
+88 atoms in group gHOT
+group           gCOLD region rCOLD
+80 atoms in group gCOLD
+group           mobile subtract all walls
+1520 atoms in group mobile
+
+# ---------------- equilibration -------------------------------------------
+velocity        all    create 300.0 ${seed} mom yes rot yes dist gaussian
+velocity        all    create 300.0 1 mom yes rot yes dist gaussian
+velocity        walls  set 0.0 0.0 0.0
+fix             fw walls setforce 0.0 0.0 0.0
+
+fix             f1 mobile npt temp 300.0 300.0 0.05 x 0.0 0.0 0.5 y 0.0 0.0 0.5 couple none
+thermo          10000
+thermo_style    custom step temp press pe lx ly
+run             200000                  # 100 ps NPT
+Neighbor list info ...
+  update: every = 1 steps, delay = 0 steps, check = yes
+  max neighbors/atom: 2000, page size: 100000
+  master list distance cutoff = 4.7911
+  ghost atom cutoff = 4.7911
+  binsize = 2.39555, bins = 12 95 14
+  1 neighbor lists, perpetual/occasional/extra = 1 0 0
+  (1) pair sw, perpetual
+      attributes: full, newton on
+      pair build: full/bin/atomonly
+      stencil: full/bin/3d
+      bin: standard
+Per MPI rank memory allocation (min/avg/max) = 3.098 | 3.098 | 3.098 Mbytes
+   Step          Temp          Press          PotEng           Lx             Ly      
+         0   284.7044      -432.1512      -1793.5606      26.368         227.2        
+     10000   305.40759      63.648066     -1735.0742      26.62722       218.7927     
+     20000   311.1134      -216.1201      -1734.5539      26.615945      219.20375    
+     30000   293.68549     -206.86262     -1736.2504      26.599647      218.54505    
+     40000   299.72446      63.301278     -1733.9354      26.576689      219.29939    
+     50000   300.99187     -30.565054     -1734.222       26.615683      220.02212    
+     60000   300.97107      117.57541     -1733.6427      26.573728      218.8591     
+     70000   300.15781     -201.3445      -1738.2565      26.595989      219.58001    
+     80000   302.93324     -409.04427     -1736.6618      26.623123      218.76878    
+     90000   299.05096      20.280817     -1735.2512      26.581778      218.95905    
+    100000   304.78488      66.265639     -1736.0302      26.591624      219.15656    
+    110000   295.9993      -175.02224     -1735.5221      26.59958       219.13515    
+    120000   306.26366      249.58029     -1736.5547      26.579819      219.42205    
+    130000   296.36463     -71.329151     -1736.8347      26.620682      218.88742    
+    140000   296.28589     -244.63371     -1734.3474      26.650077      219.15619    
+    150000   304.8415      -80.882366     -1733.9443      26.590611      218.10406    
+    160000   293.50236     -371.34578     -1735.4264      26.586213      219.1166     
+    170000   304.56315      113.86591     -1735.9154      26.565525      219.21855    
+    180000   298.26618     -38.389502     -1734.5193      26.600746      219.05815    
+    190000   300.78892     -2.0614263     -1736.8372      26.626415      219.59714    
+    200000   301.84108     -154.99118     -1735.7224      26.575365      219.14828    
+Loop time of 35.9977 on 4 procs for 200000 steps with 1600 atoms
+
+Performance: 240.016 ns/day, 0.100 hours/ns, 5555.915 timesteps/s, 8.889 Matom-step/s
+99.6% CPU use with 4 MPI tasks x 1 OpenMP threads
+
+MPI task timing breakdown:
+Section |  min time  |  avg time  |  max time  |%varavg| %total
+---------------------------------------------------------------
+Pair    | 27.951     | 28.215     | 28.431     |   3.6 | 78.38
+Neigh   | 0.29698    | 0.30795    | 0.31763    |   1.4 |  0.86
+Comm    | 1.7717     | 1.9675     | 2.2297     |  13.6 |  5.47
+Output  | 0.00030997 | 0.0003618  | 0.00049787 |   0.0 |  0.00
+Modify  | 4.9749     | 4.9918     | 5.0129     |   0.6 | 13.87
+Other   |            | 0.5147     |            |       |  1.43
+
+Nlocal:            400 ave         401 max         399 min
+Histogram: 1 0 0 0 0 2 0 0 0 1
+Nghost:         237.75 ave         244 max         228 min
+Histogram: 1 0 0 0 0 0 1 1 0 1
+Neighs:              0 ave           0 max           0 min
+Histogram: 4 0 0 0 0 0 0 0 0 0
+FullNghs:       6393.5 ave        6411 max        6374 min
+Histogram: 1 0 0 0 0 2 0 0 0 1
+
+Total # of neighbors = 25574
+Ave neighs/atom = 15.98375
+Neighbor list builds = 826
+Dangerous builds = 0
+unfix           f1
+
+fix             f2 mobile nvt temp 300.0 300.0 0.05
+run             200000                  # 100 ps NVT
+Per MPI rank memory allocation (min/avg/max) = 3.098 | 3.098 | 3.098 Mbytes
+   Step          Temp          Press          PotEng           Lx             Ly      
+    200000   301.84108     -154.99118     -1735.7224      26.575365      219.14828    
+    210000   277.21656     -73.282603     -1739.7825      26.575365      219.14828    
+    220000   288.59815      33.772404     -1739.9981      26.575365      219.14828    
+    230000   287.12472      140.81165     -1740.8612      26.575365      219.14828    
+    240000   298.17215     -154.41108     -1738.3839      26.575365      219.14828    
+    250000   289.4799      -130.36083     -1737.2642      26.575365      219.14828    
+    260000   287.07208     -29.528646     -1740.5028      26.575365      219.14828    
+    270000   283.28946     -151.79198     -1738.4406      26.575365      219.14828    
+    280000   285.97531      16.839607     -1739.8751      26.575365      219.14828    
+    290000   292.64759      138.10165     -1743.1718      26.575365      219.14828    
+    300000   285.09347      32.267855     -1741.9862      26.575365      219.14828    
+    310000   282.42596      225.19156     -1739.3688      26.575365      219.14828    
+    320000   279.77108     -89.783571     -1740.4074      26.575365      219.14828    
+    330000   294.43156      104.97294     -1738.6488      26.575365      219.14828    
+    340000   278.28525      96.827356     -1736.5074      26.575365      219.14828    
+    350000   281.57338      21.82014      -1740.4094      26.575365      219.14828    
+    360000   291.29398      122.39902     -1738.4864      26.575365      219.14828    
+    370000   285.72445     -36.649366     -1741.1351      26.575365      219.14828    
+    380000   288.64209      34.776328     -1738.7964      26.575365      219.14828    
+    390000   287.62175     -134.8367      -1742.5437      26.575365      219.14828    
+    400000   281.00573      46.724879     -1740.3935      26.575365      219.14828    
+Loop time of 31.9475 on 4 procs for 200000 steps with 1600 atoms
+
+Performance: 270.443 ns/day, 0.089 hours/ns, 6260.261 timesteps/s, 10.016 Matom-step/s
+100.0% CPU use with 4 MPI tasks x 1 OpenMP threads
+
+MPI task timing breakdown:
+Section |  min time  |  avg time  |  max time  |%varavg| %total
+---------------------------------------------------------------
+Pair    | 27.501     | 27.656     | 27.826     |   2.3 | 86.57
+Neigh   | 0.092371   | 0.09533    | 0.097444   |   0.7 |  0.30
+Comm    | 1.8678     | 2.0265     | 2.1881     |   8.5 |  6.34
+Output  | 0.00030251 | 0.00035313 | 0.00049738 |   0.0 |  0.00
+Modify  | 1.6452     | 1.6702     | 1.6891     |   1.3 |  5.23
+Other   |            | 0.499      |            |       |  1.56
+
+Nlocal:            400 ave         408 max         392 min
+Histogram: 1 0 0 0 0 2 0 0 0 1
+Nghost:         221.25 ave         226 max         214 min
+Histogram: 1 0 0 0 0 0 1 1 0 1
+Neighs:              0 ave           0 max           0 min
+Histogram: 4 0 0 0 0 0 0 0 0 0
+FullNghs:         6394 ave        6528 max        6264 min
+Histogram: 1 0 0 0 1 1 0 0 0 1
+
+Total # of neighbors = 25576
+Ave neighs/atom = 15.985
+Neighbor list builds = 252
+Dangerous builds = 0

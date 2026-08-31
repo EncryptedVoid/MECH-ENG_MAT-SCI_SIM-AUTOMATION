@@ -1,0 +1,84 @@
+# ===========================================================================
+#  BP VALIDATION - ZIGZAG transport (heat flows along X)
+#  Method: Langevin two-bath NEMD (same method as Song et al. ZnO/hBN papers)
+#  Everything is written EXPLICITLY - no runtime branching.
+#
+#  Run:  lmp -in in.bp_zigzag -var infile bp_zz_W12_L68.data -var seed 11111
+# ===========================================================================
+units           metal
+dimension       3
+boundary        p p p
+atom_style      atomic
+
+read_data       ${infile}
+
+pair_style      sw
+pair_coeff      * * bp.sw B T          # type1 -> B (bottom), type2 -> T (top)
+
+neighbor        2.0 bin
+neigh_modify    delay 0 every 1 check yes
+timestep        0.0005                  # 0.5 fs
+
+# ---------------- slab geometry along X -----------------------------------
+variable        xL      equal xlo
+variable        xH      equal xhi
+variable        wall    equal 6.0       # fixed wall thickness (A)
+variable        bath    equal 12.0      # reservoir thickness (A)
+variable        x1      equal ${xL}+${wall}
+variable        x2      equal ${x1}+${bath}
+variable        x4      equal ${xH}-${wall}
+variable        x3      equal ${x4}-${bath}
+
+region          rWL   block ${xL} ${x1} INF INF INF INF units box
+region          rWH   block ${x4} ${xH} INF INF INF INF units box
+region          rHOT  block ${x1} ${x2} INF INF INF INF units box
+region          rCOLD block ${x3} ${x4} INF INF INF INF units box
+
+group           gWL   region rWL
+group           gWH   region rWH
+group           walls union gWL gWH
+group           gHOT  region rHOT
+group           gCOLD region rCOLD
+group           mobile subtract all walls
+
+# ---------------- equilibration -------------------------------------------
+velocity        all    create 300.0 ${seed} mom yes rot yes dist gaussian
+velocity        walls  set 0.0 0.0 0.0
+fix             fw walls setforce 0.0 0.0 0.0
+
+fix             f1 mobile npt temp 300.0 300.0 0.05 x 0.0 0.0 0.5 y 0.0 0.0 0.5 couple none
+thermo          10000
+thermo_style    custom step temp press pe lx ly
+run             200000                  # 100 ps NPT
+unfix           f1
+
+fix             f2 mobile nvt temp 300.0 300.0 0.05
+run             200000                  # 100 ps NVT
+unfix           f2
+reset_timestep  0
+
+# ---------------- NEMD production -----------------------------------------
+fix             f3 mobile nve
+fix             fhot  gHOT  langevin 320.0 320.0 0.1 ${seed} tally yes
+fix             fcold gCOLD langevin 280.0 280.0 0.1 ${seed} tally yes
+
+compute         ke all ke/atom
+variable        tatom atom c_ke/(1.5*8.617333262e-5)
+
+# 40 bins along x.  units reduced -> 3rd arg is the bin WIDTH fraction.
+variable        nbins equal 40
+variable        binw  equal 1.0/${nbins}
+compute         cc mobile chunk/atom bin/1d x lower ${binw} units reduced
+fix             fp mobile ave/chunk 200 2000 400000 cc v_tatom file T_profile.dat
+
+variable        tps equal step*dt
+variable        eh  equal f_fhot
+variable        ec  equal f_fcold
+fix             fm all print 20000 "${tps} ${eh} ${ec}" file ebath.dat &
+                title "t_ps E_hot_eV E_cold_eV" screen no
+
+thermo          40000
+thermo_style    custom step temp f_fhot f_fcold
+run             4000000                 # 2 ns production
+
+print "DONE zigzag  ${infile}"

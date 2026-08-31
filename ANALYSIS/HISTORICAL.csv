@@ -1,0 +1,2 @@
+session_id,start_timestamp,total_duration_sec,num_runs,num_failed,num_aborted,avg_duration_per_run_sec,avg_gpu_usage_pct,avg_cpu_usage_pct,avg_gpu_temp_c,avg_cpu_temp_c,avg_ram_usage_pct
+20260829000053,20260829000053,55787.82,40,0,34,1394.7,,26.32,,56.98,85.62
