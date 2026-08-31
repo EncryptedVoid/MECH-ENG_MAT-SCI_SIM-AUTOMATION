@@ -25,7 +25,7 @@ https://github.com/user-attachments/assets/06245dcf-2dc0-4990-9824-5278c23d4e81
 
 Want to see what LAVA produces before installing anything? A complete example session
 lives in [`DEMO-ANALYSIS/`](./DEMO-ANALYSIS/). The best-looking session to explore is
-📊 **[REPORT_20260827214250.html](./DEMO-ANALYSIS/SESSIONS/SESSION-20260827214250/REPORT_20260827214250.html)**
+📊 **[REPORT_20260827214250.html](https://github.com/EncryptedVoid/MECH-ENG_MAT-SCI_SIM-AUTOMATION/blob/main/DEMO_SESSION-20260829000053/REPORT_20260829000053.html)**
 
 ---
 
