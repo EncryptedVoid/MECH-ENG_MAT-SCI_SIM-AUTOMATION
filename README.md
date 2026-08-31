@@ -1,3 +1,5 @@
+
+
 # LAVA — LAMMPS Automation Validation Aid
 
 LAVA is a friendly, click-through app for running batches of LAMMPS molecular-dynamics
@@ -17,7 +19,7 @@ Gazi".*
 
 ## See it in action
 
-[▶ Watch the demo (LAVA-DEMO.mp4)](./LAVA-DEMO.mp4)
+https://github.com/user-attachments/assets/06245dcf-2dc0-4990-9824-5278c23d4e81
 
 **Sample Report**
 
