@@ -1,0 +1,135 @@
+# ===========================================================================
+#  WS2/BP twisted bilayer - IN-PLANE thermal conductivity (heat // x)
+#  Langevin two-bath NEMD.  Relative-kappa study: fixed L, vary twist & BP dir.
+#
+#  Run:
+#    mpirun --oversubscribe -np 16 lmp -in in.nemd \
+#           -var infile structures/bilayer_th00p00_zz.data -var seed 11111
+#
+#  CPU ONLY - the GPU package rejects two sw instances in hybrid/overlay.
+# ===========================================================================
+
+# --------------------------- 1. SETUP -------------------------------------
+units           metal
+dimension       3
+boundary        p p p
+atom_style      atomic
+
+variable        run_NPT    equal 2000
+variable        run_NVT    equal 1000
+variable        run_NVE    equal 1000
+variable        run_PROD   equal 5000
+variable        T_mean     equal 300.0
+variable        T_hot      equal 320.0
+variable        T_cold     equal 280.0
+variable        T_damp     equal 0.1
+variable        wall_th    equal 8.0         # fixed wall thickness (A)
+variable        bath_th    equal 15.0        # Langevin reservoir thickness (A)
+variable        nbin       equal 20          # chunks across the conducting region
+
+read_data       ${infile}
+
+# --------------------------- 2. POTENTIALS --------------------------------
+# WS2 intralayer : SW (types 1,2,3 = W,St,Sb)
+# BP  intralayer : SW (types 4,5   = Pb,Pt)
+# WS2-BP interlayer : LJ 12-6, UFF geometric mixing (W-P and S-P only)
+pair_style      hybrid/overlay sw sw lj/cut 10.0
+pair_coeff      * * sw 1 ws2.sw W St Sb NULL NULL
+pair_coeff      * * sw 2 bp.sw  NULL NULL NULL B T
+pair_coeff      1 4 lj/cut 0.0061989 3.17829     # W  - P(bottom)
+pair_coeff      1 5 lj/cut 0.0061989 3.17829     # W  - P(top)
+pair_coeff      2 4 lj/cut 0.0125359 3.64433     # St - P(bottom)
+pair_coeff      2 5 lj/cut 0.0125359 3.64433     # St - P(top)
+pair_coeff      3 4 lj/cut 0.0125359 3.64433     # Sb - P(bottom)
+pair_coeff      3 5 lj/cut 0.0125359 3.64433     # Sb - P(top)
+
+neighbor        2.0 bin
+neigh_modify    delay 0 every 1 check yes
+timestep        0.0005
+
+# --------------------------- 3. MINIMISATION ------------------------------
+# Essential for twisted moire geometries: the as-built registry is not relaxed.
+min_style       fire
+minimize        1.0e-6 1.0e-8 2000 20000
+reset_timestep  0
+
+# --------------------------- 4a. NPT (relax the in-plane box) -------------
+# x and y barostatted independently (BP is anisotropic, so do NOT couple them).
+# z is NOT barostatted - the cell contains vacuum.
+velocity        all create ${T_mean} ${seed} mom yes rot yes dist gaussian
+fix             fNPT all npt temp ${T_mean} ${T_mean} 0.05 &
+                x 0.0 0.0 0.5 y 0.0 0.0 0.5
+thermo          20000
+thermo_style    custom step temp press pe etotal lx ly
+run             ${run_NPT}
+unfix           fNPT
+
+# --------------------------- 4b. define slabs (box now settled) -----------
+variable        xA equal xlo+${wall_th}
+variable        xB equal ${xA}+${bath_th}
+variable        xD equal xhi-${wall_th}
+variable        xC equal ${xD}-${bath_th}
+variable        dbin equal (${xD}-${xB}-${bath_th})/${nbin}
+
+region          rWL   block INF   ${xA} INF INF INF INF units box
+region          rWH   block ${xD} INF   INF INF INF INF units box
+region          rCOLD block ${xA} ${xB} INF INF INF INF units box
+region          rHOT  block ${xC} ${xD} INF INF INF INF units box
+
+group           gWL   region rWL
+group           gWH   region rWH
+group           walls union gWL gWH
+group           gCOLD region rCOLD
+group           gHOT  region rHOT
+group           bulk  subtract all walls
+
+group           ws2   type 1 2 3
+group           bp    type 4 5
+group           bulk_ws2 intersect bulk ws2
+group           bulk_bp  intersect bulk bp
+
+velocity        walls set 0.0 0.0 0.0
+fix             fFREEZE walls setforce 0.0 0.0 0.0
+
+# --------------------------- 4c. NVT then NVE -----------------------------
+fix             fNVT bulk nvt temp ${T_mean} ${T_mean} 0.05
+thermo_style    custom step temp press pe etotal
+run             ${run_NVT}
+unfix           fNVT
+
+fix             fNVE bulk nve
+thermo_style    custom step temp pe etotal
+run             ${run_NVE}
+unfix           fNVE
+
+write_data      after_eq_${seed}.lmp
+reset_timestep  0
+
+# --------------------------- 5. NEMD PRODUCTION ---------------------------
+fix             fINT  bulk  nve
+fix             fhot  gHOT  langevin ${T_hot}  ${T_hot}  ${T_damp} ${seed} tally yes
+fix             fcold gCOLD langevin ${T_cold} ${T_cold} ${T_damp} ${seed} tally yes
+
+compute         ke all ke/atom
+variable        tatom atom c_ke/(1.5*8.617333262e-5)
+
+# 20 chunks spanning ONLY the conducting region (baths and walls excluded),
+# so the gradient fit never sees the thermostatted plateaus.
+compute         cc     bulk     chunk/atom bin/1d x ${xB} ${dbin} units box bound x ${xB} ${xC}
+compute         cc_ws2 bulk_ws2 chunk/atom bin/1d x ${xB} ${dbin} units box bound x ${xB} ${xC}
+compute         cc_bp  bulk_bp  chunk/atom bin/1d x ${xB} ${dbin} units box bound x ${xB} ${xC}
+
+fix             fp     bulk     ave/chunk 50 20 1000 cc     v_tatom file T_profile.dat
+fix             fp_ws2 bulk_ws2 ave/chunk 50 20 1000 cc_ws2 v_tatom file T_profile_ws2.dat
+fix             fp_bp  bulk_bp  ave/chunk 50 20 1000 cc_bp  v_tatom file T_profile_bp.dat
+
+# cumulative reservoir energies -> heat flux
+variable        eh equal f_fhot
+variable        ec equal f_fcold
+fix             fe all ave/time 500 1 500 v_eh v_ec file ebath.dat
+
+thermo          40000
+thermo_style    custom step temp f_fhot f_fcold
+run             ${run_PROD}
+
+print "DONE ${infile} seed ${seed}"
