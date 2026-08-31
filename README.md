@@ -17,29 +17,13 @@ Gazi".*
 
 ## See it in action
 
-**Watch the demo:**
+[▶ Watch the demo (LAVA-DEMO.mp4)](./LAVA-DEMO.mp4)
 
-https://github.com/user-attachments/assets/LAVA-DEMO.mp4
-
-<!-- If the video above does not play inline, download it directly: [LAVA-DEMO.mp4](./LAVA-DEMO.mp4) -->
-
-**Sample outputs**
+**Sample Report**
 
 Want to see what LAVA produces before installing anything? A complete example session
 lives in [`DEMO-ANALYSIS/`](./DEMO-ANALYSIS/). The best-looking session to explore is
-in [`DEMO-ANALYSIS/SESSIONS/SESSION-20260827214250/`](./DEMO-ANALYSIS/SESSIONS/SESSION-20260827214250/):
-
-- 📊 **[REPORT_20260827214250.html](./DEMO-ANALYSIS/SESSIONS/SESSION-20260827214250/REPORT_20260827214250.html)**
-  — the interactive HTML report. Download it and open in any browser to explore the graphs, hover for values, and zoom in.
-- 🖼️ **[HW-USAGE_20260827214250.png](./DEMO-ANALYSIS/SESSIONS/SESSION-20260827214250/HW-USAGE_20260827214250.png)**
-  — a hardware-usage graph showing CPU, RAM, and GPU over the session.
-- 📈 **[SESSION-HW-STATS_20260827214250.csv](./DEMO-ANALYSIS/SESSIONS/SESSION-20260827214250/SESSION-HW-STATS_20260827214250.csv)**
-  — the raw hardware readings behind the graphs.
-- 📝 **[SESSION_20260827214250.log](./DEMO-ANALYSIS/SESSIONS/SESSION-20260827214250/SESSION_20260827214250.log)**
-  — the plain-text log of everything that happened during the session.
-
-> GitHub can't render an HTML report in the browser directly — download it (or use the
-> "Download raw file" button) and open the file locally.
+📊 **[REPORT_20260827214250.html](./DEMO-ANALYSIS/SESSIONS/SESSION-20260827214250/REPORT_20260827214250.html)**
 
 ---
 
