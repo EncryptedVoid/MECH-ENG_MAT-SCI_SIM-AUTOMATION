@@ -217,3 +217,11 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 *.mp4
+
+TEMP/
+
+ANALYSIS/
+
+LOGS/
+
+PROJECT/
