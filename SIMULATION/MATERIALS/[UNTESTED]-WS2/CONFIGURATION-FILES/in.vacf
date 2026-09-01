@@ -1,0 +1,74 @@
+# ===========================================================================
+#  WS2/BP bilayer - equilibrium VELOCITY DUMP for phonon DOS / heat capacity
+#  300 K NVE, dump per-atom velocities of each layer separately.
+#  Feeds heat_capacity.py (VACF -> DOS -> quantum C_V).
+#
+#  Run:
+#    mpirun --oversubscribe -np 16 lmp -in in.vacf \
+#           -var infile structures/bilayer_th00p00_ac.data -var seed 11111
+#
+#  dt_dump = dump_every * timestep = 10 * 0.0005 = 0.005 ps  -> pass to
+#  heat_capacity.py as --dt_dump 0.005.  Nyquist = 1/(2*0.005ps)=100 THz,
+#  well above the ~15 THz top of the WS2/BP phonon bands.
+# ===========================================================================
+
+units           metal
+dimension       3
+boundary        p p p
+atom_style      atomic
+
+variable        run_NPT  equal 400000     # 200 ps box relax
+variable        run_EQ   equal 400000     # 200 ps equilibrate
+variable        run_VACF equal 200000     # 100 ps velocity capture
+variable        T_mean   equal 300.0
+variable        dump_every equal 10       # -> dt_dump = 0.005 ps
+
+read_data       ${infile}
+
+pair_style      hybrid/overlay sw sw lj/cut 10.0
+pair_coeff      * * sw 1 ws2.sw W St Sb NULL NULL
+pair_coeff      * * sw 2 bp.sw  NULL NULL NULL B T
+pair_coeff      1 4 lj/cut 0.0061989 3.17829
+pair_coeff      1 5 lj/cut 0.0061989 3.17829
+pair_coeff      2 4 lj/cut 0.0125359 3.64433
+pair_coeff      2 5 lj/cut 0.0125359 3.64433
+pair_coeff      3 4 lj/cut 0.0125359 3.64433
+pair_coeff      3 5 lj/cut 0.0125359 3.64433
+
+neighbor        2.0 bin
+neigh_modify    delay 0 every 1 check yes
+timestep        0.0005
+
+min_style       fire
+minimize        1.0e-8 1.0e-10 20000 200000
+reset_timestep  0
+
+group           ws2   type 1 2 3
+group           bp    type 4 5
+
+velocity        all create ${T_mean} ${seed} mom yes rot yes dist gaussian
+fix             fNPT all npt temp ${T_mean} ${T_mean} 0.05 &
+                x 0.0 0.0 0.5 y 0.0 0.0 0.5
+thermo          20000
+thermo_style    custom step temp press lx ly
+run             ${run_NPT}
+unfix           fNPT
+reset_timestep  0
+
+fix             fEQ all nvt temp ${T_mean} ${T_mean} 0.05
+run             ${run_EQ}
+unfix           fEQ
+reset_timestep  0
+
+# --------------------------- VACF CAPTURE (NVE) ---------------------------
+# Microcanonical so velocities are unperturbed by a thermostat.
+fix             fNVE all nve
+dump            dws2 ws2 custom ${dump_every} vacf_ws2_${seed}.dump id vx vy vz
+dump            dbp  bp  custom ${dump_every} vacf_bp_${seed}.dump  id vx vy vz
+dump_modify     dws2 sort id
+dump_modify     dbp  sort id
+thermo          20000
+thermo_style    custom step temp etotal
+run             ${run_VACF}
+
+print "DONE ${infile} seed ${seed}"

@@ -1,0 +1,94 @@
+# ===========================================================================
+#  WS2/BP bilayer - INTERFACIAL thermal conductance by THERMAL RELAXATION
+#  Heat WS2 to T_hot / hold BP at T_cold (Langevin, 1 ns), release to NVE,
+#  log per-layer temperature for 1 ns.  Fit dT(t) decay -> tau -> G.
+#
+#  Run:
+#    mpirun --oversubscribe -np 16 lmp -in in.relax \
+#           -var infile structures/bilayer_th00p00_ac.data -var seed 11111
+#
+#  Same potentials/units/groups as in.nemd.  FULLY PERIODIC - no walls,
+#  no spatial baths; the two "baths" here are the two LAYERS (whole-group
+#  Langevin), which is what the relaxation method requires.
+# ===========================================================================
+
+units           metal
+dimension       3
+boundary        p p p
+atom_style      atomic
+
+variable        run_NPT   equal 400000      # 200 ps  box relax
+variable        run_EQ    equal 400000      # 200 ps  equilibrate at T_mean
+variable        run_HOLD  equal 2000000     # 1 ns    two-temperature hold
+variable        run_FREE  equal 2000000     # 1 ns    free NVE relaxation
+variable        T_mean    equal 300.0
+variable        T_hot     equal 500.0       # WS2 driven hot (paper used 500)
+variable        T_cold    equal 300.0       # BP held at 300
+variable        T_damp    equal 0.1
+
+read_data       ${infile}
+
+# --------------------------- POTENTIALS (identical to in.nemd) ------------
+pair_style      hybrid/overlay sw sw lj/cut 10.0
+pair_coeff      * * sw 1 ws2.sw W St Sb NULL NULL
+pair_coeff      * * sw 2 bp.sw  NULL NULL NULL B T
+pair_coeff      1 4 lj/cut 0.0061989 3.17829
+pair_coeff      1 5 lj/cut 0.0061989 3.17829
+pair_coeff      2 4 lj/cut 0.0125359 3.64433
+pair_coeff      2 5 lj/cut 0.0125359 3.64433
+pair_coeff      3 4 lj/cut 0.0125359 3.64433
+pair_coeff      3 5 lj/cut 0.0125359 3.64433
+
+neighbor        2.0 bin
+neigh_modify    delay 0 every 1 check yes
+timestep        0.0005
+
+# --------------------------- MINIMISE (twisted registry) ------------------
+min_style       fire
+minimize        1.0e-8 1.0e-10 20000 200000
+reset_timestep  0
+
+# --------------------------- LAYER GROUPS ---------------------------------
+group           ws2   type 1 2 3
+group           bp    type 4 5
+
+# --------------------------- NPT box relax --------------------------------
+velocity        all create ${T_mean} ${seed} mom yes rot yes dist gaussian
+fix             fNPT all npt temp ${T_mean} ${T_mean} 0.05 &
+                x 0.0 0.0 0.5 y 0.0 0.0 0.5
+thermo          20000
+thermo_style    custom step temp press pe etotal lx ly
+run             ${run_NPT}
+unfix           fNPT
+reset_timestep  0
+
+# --------------------------- equilibrate at T_mean ------------------------
+fix             fEQ all nvt temp ${T_mean} ${T_mean} 0.05
+run             ${run_EQ}
+unfix           fEQ
+reset_timestep  0
+
+# --------------------------- TWO-TEMPERATURE HOLD -------------------------
+# WS2 driven to T_hot, BP held at T_cold, each by whole-group Langevin.
+# nve integrates all atoms; langevin only adds/removes heat.
+fix             fINT all nve
+fix             fLH  ws2 langevin ${T_hot}  ${T_hot}  ${T_damp} ${seed}
+fix             fLC  bp  langevin ${T_cold} ${T_cold} ${T_damp} ${seed}
+
+compute         Tws2 ws2 temp
+compute         Tbp  bp  temp
+thermo          20000
+thermo_style    custom step c_Tws2 c_Tbp pe etotal
+run             ${run_HOLD}
+
+# --------------------------- RELEASE: free NVE relaxation -----------------
+unfix           fLH
+unfix           fLC
+# fINT (nve on all) stays on. Log both layer temperatures every 1 ps.
+reset_timestep  0
+fix             fTout all ave/time 100 20 2000 c_Tws2 c_Tbp file relax_T_${seed}.dat
+thermo          20000
+thermo_style    custom step c_Tws2 c_Tbp etotal
+run             ${run_FREE}
+
+print "DONE ${infile} seed ${seed}"
