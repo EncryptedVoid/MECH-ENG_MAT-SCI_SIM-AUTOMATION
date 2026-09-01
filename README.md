@@ -295,4 +295,4 @@ when asking for help.
 
 ---
 
-*Made by ASHIQ GAZI · Ashiq.live · LAVA version 0.4.0*
+*Made by ASHIQ GAZI · Ashiq.live · LAVA version 0.8.0*
