@@ -87,9 +87,6 @@ password, used only to install what the build needs.)
 launches LAVA. Re-run `./entrypoint.sh` any time to open it again — it always freshens
 packages first, and it auto-detects `apt`, `dnf`, or `pacman`.
 
-> On Linux, a line starting with `$` just means "type this and press Enter" — don't type
-> the `$` itself. (Windows users don't type anything; it's all double-clicks.)
-
 ---
 
 ## Using LAVA — the home screen
