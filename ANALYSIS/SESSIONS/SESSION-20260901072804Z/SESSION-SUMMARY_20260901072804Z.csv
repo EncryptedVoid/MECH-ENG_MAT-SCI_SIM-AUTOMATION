@@ -1,0 +1,2 @@
+run_index,run_id,material,status,potential,structure,configuration,seed,start_time,end_time,duration_sec,exit_code,avg_gpu_usage_pct,avg_cpu_usage_pct,avg_gpu_temp_c,avg_cpu_temp_c,avg_ram_usage_pct
+1,[ABORTED]-RUN-0001-20260901072804Z,ZincOxide,ABORTED_EARLY,none,zno_L20.data,in.zno_kappa,1,2026-09-01T13:28:04,2026-09-01T15:15:02,6418.05,ABORTED_EARLY,,21.0,,55.55,67.53

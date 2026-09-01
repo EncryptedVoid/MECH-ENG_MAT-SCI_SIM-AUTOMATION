@@ -1,17 +1,42 @@
 #!/usr/bin/env python3
 """
-LAVA constants - single source of truth for all configuration values.
-=====================================================================
-Edit values here directly; every other module imports from this file. This is
-plain Python on purpose, so paths (Path.home()), computed strings (FOOTER), and
-tkinter font tuples all just work with no loader or parsing step.
+LAVA constants — the single source of truth for every configuration value.
+==========================================================================
 
-Used by run.py (all of it), helpers.py (MATERIAL_SUBDIRS, INPUT_EXT,
-DEFAULT_PROBE_SEC) and report.py (FOOTER).
+WHAT THIS FILE IS
+-----------------
+Plain Python data: version/branding strings, the volcanic colour palette,
+tkinter font tuples, build paths, the project-folder layout, accepted input
+extensions, output-rename rules, and default limits. Nothing here does any
+work — it only *declares* values. Because it is plain Python (not JSON/INI), it
+can hold computed values directly: Path.home(), the FOOTER f-string, tuples for
+fonts, and sets for extensions all just work with no loader or parse step.
 
-NOTE - values duplicated in setup.sh: CUDA_MIN, the build root, and the binary
-path also appear (as bash) in setup.sh. If you change them here, change them
-there too - nothing keeps the two in sync automatically. See ARCHITECTURE.md.
+WHO IMPORTS IT
+--------------
+Everything. helpers.py, report.py, and run.py all import names from here.
+This module imports NOTHING from the project — only the stdlib pathlib. That
+one-way rule is what keeps the import graph acyclic:
+
+    constants.py  --imported by-->  helpers.py, report.py, run.py
+
+WORKING ON THIS FILE (for humans and LLMs)
+------------------------------------------
+* To change a colour, font, default limit, path, or accepted extension, edit it
+  HERE — there is no other config file and no runtime override.
+* Keep this module pure data + stdlib only. Do NOT import helpers, report, or
+  run into it (that would create an import cycle), and do not do heavy work at
+  import time.
+* You can understand and safely edit this file in complete isolation: no other
+  project file needs to be open to change a value here. Downstream modules read
+  these names but never write them.
+
+DIVERGENCE NOTE
+---------------
+CUDA_MIN, the build root (~/.lammps-build), and the binary path (build/lmp) are
+also hard-coded (in bash) inside the standalone build script named by
+BUILD_SCRIPT. Nothing syncs the two. If you change them here, change them in
+that script too. See ARCHITECTURE.md.
 """
 
 from pathlib import Path
@@ -19,11 +44,11 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Version / branding
 # ---------------------------------------------------------------------------
-VERSION = "0.4.0"
+VERSION = "0.8.0"
 APP_NAME = "LAVA"
 APP_SUBTITLE = "LAMMPS AUTOMATION VALIDATION AID"
 APP_CREDIT = ('Project developed in conjunction with BUET Mechanical Engineering '
-              'student "Kazi Rubaiyat Mustafix" and University of the People '
+              'student "Kazi Rubaiyat Mustafiz" and University of the People '
               'Computer Science student "Ashiq Arib Gazi"')
 FOOTER = f"Made by ASHIQ GAZI | Ashiq.live | VERSION {VERSION}"
 LOGO_FILE = "LOGO.webp"
@@ -47,10 +72,23 @@ FONT = ("TkDefaultFont", 10)
 FONT_BOLD = ("TkDefaultFont", 10, "bold")
 FONT_MONO = ("TkFixedFont", 9)
 
+# Preferred UI font family, applied at startup by run.py if it is installed on
+# the system (tkinter can only use OS-installed fonts, not a bundled .ttf). The
+# fallback is a generic sans-serif via tkinter's built-in default fonts above.
+# run.py resolves FONT / FONT_BOLD / FONT_MONO against the installed families
+# once the Tk root exists and writes the resolved tuples back here, so every
+# widget that reads constants.FONT* picks up the choice with no other changes.
+# To try a different font, change PREFERRED_FONT (and install it on each
+# machine, e.g. `apt install fonts-roboto` on Linux); if it is absent LAVA
+# falls back to the sans-serif defaults above rather than breaking.
+PREFERRED_FONT = "Roboto Mono"
+FONT_SIZE = 10
+FONT_SIZE_MONO = 9
+
 # ---------------------------------------------------------------------------
 # Build / paths
 # ---------------------------------------------------------------------------
-BUILD_SCRIPT = "setup.sh"
+BUILD_SCRIPT = "build-lammps.sh"
 LAMMPS_BUILD_ROOT = Path.home() / ".lammps-build"
 LAMMPS_BIN = LAMMPS_BUILD_ROOT / "build" / "lmp"
 CUDA_MIN = "12.8"
@@ -85,9 +123,26 @@ OUTPUT_RENAME = {
 }
 
 # ---------------------------------------------------------------------------
+# Community-contributed materials
+# ---------------------------------------------------------------------------
+# Community-contributed material folders are committed with this name prefix
+# until a CI run validates them. Anything carrying it is shown as "untested".
+UNTESTED_PREFIX = "[UNTESTED]-"
+# Optional per-material metadata file (name, description, tested flag).
+MATERIAL_INFO_NAME = "MATERIAL-INFO.json"
+
+# The three asset rows shown in the material-profile editor, mapped to the
+# MATERIAL_SUBDIRS keys used everywhere else.
+EDITOR_ROWS = [
+    ("potentials", "POTENTIAL FILE(S)"),
+    ("structures", "STRUCTURE FILE(S)"),
+    ("configs", "CONFIGURATION/INPUT FILE(S)"),
+]
+
+# ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
 DEFAULT_PROBE_SEC = 60
-DEFAULT_MAX_CPU = 100
+DEFAULT_MAX_CPU = 90
 DEFAULT_MAX_RAM = 90
-DEFAULT_MAX_GPU = 100
+DEFAULT_MAX_GPU = 90

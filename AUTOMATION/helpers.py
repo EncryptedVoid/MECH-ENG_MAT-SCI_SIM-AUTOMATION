@@ -1,39 +1,65 @@
 #!/usr/bin/env python3
 """
-LAVA helpers - pure, GUI-free logic.
+LAVA helpers — pure, GUI-free logic.
 ====================================
-Everything in this module is independent of tkinter and of the App class:
-time/stamp formatting, seed parsing, filesystem discovery, CSV I/O, LAMMPS
-output parsers, environment probes, and the background MetricsSampler.
 
-Design rules for this file (keep it this way):
-  * NO tkinter imports. Nothing here may touch the GUI.
-  * Functions take plain arguments and return plain data, so they are unit
-    testable in isolation.
-  * One module-level logger, shared by every function in this file
-    (`log = logging.getLogger(__name__)`). MetricsSampler uses its own
-    "metrics" logger so its lines are tagged distinctly in the log files.
+WHAT THIS FILE IS
+-----------------
+Every piece of LAVA's logic that does NOT touch the GUI: time/stamp
+formatting, seed parsing, filesystem discovery of materials and their input
+files, the community-material helpers (slugify, untested-name handling,
+per-material MATERIAL-INFO.json read/write), past-session scanning, CSV
+read/write, LAMMPS output parsers (ebath and temperature-profile), environment
+probes (psutil / nvidia-smi / hardware detection), and the background
+MetricsSampler that samples CPU/RAM/GPU on its own thread.
 
-Logging destinations (file handlers, GUI queue) are configured centrally in
-run.py; this module only emits records and never configures handlers.
+Every function takes plain arguments and returns plain data, so all of it is
+unit-testable with no display and no App instance. The one class here,
+MetricsSampler, only samples and stores numbers; it never touches tkinter.
+
+WHO IMPORTS IT / WHAT IT IMPORTS
+--------------------------------
+Imported by run.py (and usable by report.py). It imports only the stdlib and
+values from constants.py. It NEVER imports report.py or run.py — that keeps the
+graph acyclic:
+
+    constants.py  --imported by-->  helpers.py  --imported by-->  run.py
+
+WORKING ON THIS FILE (for humans and LLMs)
+------------------------------------------
+* This module is self-contained: to understand or change a function here you
+  need only this file and the handful of names it reads from constants.py
+  (MATERIAL_SUBDIRS, INPUT_EXT, DEFAULT_PROBE_SEC, UNTESTED_PREFIX,
+  MATERIAL_INFO_NAME). You do not need run.py or report.py open.
+* Keep the no-tkinter, no-App rule. If you are tempted to import the GUI or
+  reach for App state, the logic belongs in run.py instead.
+* Logging: functions here are silent by default. MetricsSampler swallows probe
+  failures (a missing sensor must never crash a run). If you add logging, do it
+  via a passed-in callable, not by importing GUI code.
+* Because these functions are pure, the right way to verify a change is a small
+  unit test (see ARCHITECTURE.md, "Testing without a display").
 """
 
+import os
+import re
 import csv
+import json
 import shutil
-import logging
+import platform
 import threading
 import subprocess
 import datetime as dt
 from pathlib import Path
 
-from constants import MATERIAL_SUBDIRS, INPUT_EXT, DEFAULT_PROBE_SEC
+from constants import (
+    MATERIAL_SUBDIRS,
+    INPUT_EXT,
+    DEFAULT_PROBE_SEC,
+    UNTESTED_PREFIX,
+    MATERIAL_INFO_NAME,
+)
 
-log = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Time / stamp helpers
-# ---------------------------------------------------------------------------
 def now_iso() -> str:
     return dt.datetime.now().isoformat(timespec="seconds")
 
@@ -43,25 +69,27 @@ def now_stamp() -> str:
 def stamp_of(ts) -> str:
     return ts.strftime("%Y%m%d%H%M%S")
 
-def fmt_hms(seconds):
-    if seconds is None:
-        return "unknown"
-    seconds = int(seconds)
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    if h:
-        return f"{h}h {m}m {s}s"
-    if m:
-        return f"{m}m {s}s"
-    return f"{s}s"
+def script_dir() -> Path:
+    return Path(__file__).resolve().parent
 
+def repo_root() -> Path:
+    """The project root: one level above AUTOMATION/ (where run.py lives)."""
+    return script_dir().parent
 
-# ---------------------------------------------------------------------------
-# Seed parsing
-# ---------------------------------------------------------------------------
+def is_untested_name(name: str) -> bool:
+    return name.startswith(UNTESTED_PREFIX)
+
+def display_material_name(name: str) -> str:
+    """Strip the untested prefix for display; leave tested names untouched."""
+    return name[len(UNTESTED_PREFIX):] if is_untested_name(name) else name
+
+def slugify(text: str) -> str:
+    """Filesystem/git-ref-safe slug: lowercase, non-alnum -> hyphen, trimmed."""
+    s = re.sub(r"[^A-Za-z0-9]+", "-", text.strip()).strip("-").lower()
+    return s or "material"
+
 def parse_seeds(spec: str):
     """Parse 'X,Y,A-B,Z' -> sorted unique ints. Raises ValueError on bad tokens."""
-    import re
     if not spec or not spec.strip():
         return []
     out = set()
@@ -81,10 +109,6 @@ def parse_seeds(spec: str):
             raise ValueError(f"invalid seed token: {tok!r}")
     return sorted(out)
 
-
-# ---------------------------------------------------------------------------
-# Environment probes
-# ---------------------------------------------------------------------------
 def have_nvidia_smi() -> bool:
     if not shutil.which("nvidia-smi"):
         return False
@@ -102,10 +126,6 @@ def have_psutil() -> bool:
     except Exception:
         return False
 
-
-# ---------------------------------------------------------------------------
-# Filesystem discovery
-# ---------------------------------------------------------------------------
 def looks_like_input(path: Path, kind: str) -> bool:
     name = path.name
     if name.startswith(".") or name == "__init__.py":
@@ -136,10 +156,76 @@ def discover_materials(root: Path):
             out[d.name] = d
     return out
 
+def read_material_info(material_dir: Path) -> dict:
+    """Optional per-material metadata (description, contributor, tested flag).
 
-# ---------------------------------------------------------------------------
-# CSV I/O
-# ---------------------------------------------------------------------------
+    Absent file -> empty dict. Never raises."""
+    try:
+        p = material_dir / MATERIAL_INFO_NAME
+        if p.exists():
+            with open(p) as fh:
+                return json.load(fh) or {}
+    except Exception:
+        pass
+    return {}
+
+def write_material_info(material_dir: Path, info: dict):
+    material_dir.mkdir(parents=True, exist_ok=True)
+    with open(material_dir / MATERIAL_INFO_NAME, "w") as fh:
+        json.dump(info, fh, indent=2)
+
+def scan_sessions(root: Path):
+    """List past sessions under <root>/ANALYSIS/SESSIONS, newest first.
+
+    Each entry: {id, date, materials, report (Path or None), dir}. Reads the
+    already-written SESSION-INFO_<id>.json / SESSION-SUMMARY_<id>.csv for the
+    date and material list; falls back to the folder name when they're absent."""
+    sessions = []
+    sroot = root / "ANALYSIS" / "SESSIONS"
+    if not sroot.is_dir():
+        return sessions
+    for d in sorted(sroot.iterdir(), reverse=True):
+        if not d.is_dir() or not d.name.startswith("SESSION-"):
+            continue
+        sid = d.name[len("SESSION-"):]
+        # A stopped session's folder is tagged with -[ABORTED]; its inner files
+        # keep the plain id, so strip the tag when resolving them.
+        aborted = sid.endswith("-[ABORTED]")
+        if aborted:
+            sid = sid[:-len("-[ABORTED]")]
+        date = _session_date(sid)
+        materials = []
+        # materials come from the per-run summary CSV if present
+        summary = d / f"SESSION-SUMMARY_{sid}.csv"
+        if summary.exists():
+            try:
+                with open(summary) as fh:
+                    seen = []
+                    for row in csv.DictReader(fh):
+                        m = display_material_name(row.get("material", ""))
+                        if m and m not in seen:
+                            seen.append(m)
+                    materials = seen
+            except Exception:
+                pass
+        report = d / f"REPORT_{sid}.html"
+        sessions.append({
+            "id": sid,
+            "date": date,
+            "materials": materials,
+            "report": report if report.exists() else None,
+            "dir": d,
+        })
+    return sessions
+
+def _session_date(session_id: str) -> str:
+    """Session ids are YYYYMMDDHHMMSS stamps; format if parseable."""
+    try:
+        d = dt.datetime.strptime(session_id[:14], "%Y%m%d%H%M%S")
+        return d.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return session_id
+
 def write_csv(path: Path, fieldnames, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="") as fh:
@@ -157,10 +243,6 @@ def append_csv(path: Path, fieldnames, row):
             w.writeheader()
         w.writerow({k: ("" if row.get(k) is None else row.get(k)) for k in fieldnames})
 
-
-# ---------------------------------------------------------------------------
-# Sample summarisation
-# ---------------------------------------------------------------------------
 def _avg(vals):
     vals = [v for v in vals if isinstance(v, (int, float))]
     return round(sum(vals) / len(vals), 2) if vals else None
@@ -175,9 +257,66 @@ def summarize_samples(samples):
     }
 
 
-# ---------------------------------------------------------------------------
-# LAMMPS output parsers
-# ---------------------------------------------------------------------------
+def now_utc_iso() -> str:
+    """Current time as a UTC ISO-8601 string with a Z suffix."""
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def detect_hardware() -> dict:
+    """Best-effort machine specs via psutil / nvidia-smi / platform.
+
+    Any field that can't be determined is left blank/None rather than raising.
+    """
+    info = {
+        "cpu_model": "", "cpu_cores_physical": None, "cpu_cores_logical": None,
+        "ram_total_gb": None, "gpu_model": "", "gpu_vram_mb": None,
+        "platform": "", "python": "",
+    }
+    try:
+        info["platform"] = platform.platform()
+        info["python"] = platform.python_version()
+    except Exception:
+        pass
+    # CPU model name
+    try:
+        if os.path.exists("/proc/cpuinfo"):
+            for line in open("/proc/cpuinfo"):
+                if line.lower().startswith("model name"):
+                    info["cpu_model"] = line.split(":", 1)[1].strip()
+                    break
+    except Exception:
+        pass
+    if not info["cpu_model"]:
+        try:
+            info["cpu_model"] = platform.processor() or platform.machine()
+        except Exception:
+            pass
+    # cores + RAM
+    try:
+        import psutil
+        info["cpu_cores_physical"] = psutil.cpu_count(logical=False)
+        info["cpu_cores_logical"] = psutil.cpu_count(logical=True)
+        info["ram_total_gb"] = round(psutil.virtual_memory().total / (1024 ** 3), 2)
+    except Exception:
+        pass
+    # GPU model + VRAM
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10, check=True).stdout.strip()
+        if out:
+            first = out.splitlines()[0].split(",")
+            info["gpu_model"] = first[0].strip()
+            try:
+                info["gpu_vram_mb"] = int(float(first[1].strip()))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return info
+
+
 def parse_ebath(path: Path):
     """Parse ebath.dat / ELECTRON-BATH.txt.
 
@@ -249,26 +388,28 @@ def parse_tprof(path: Path):
                 cur_ts = None
     return (["timestep", "chunk", "coord", "ncount", "temperature"], out)
 
+def fmt_hms(seconds):
+    if seconds is None:
+        return "unknown"
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
 
 # ---------------------------------------------------------------------------
 # Metrics sampler (configurable probe interval)
 # ---------------------------------------------------------------------------
 class MetricsSampler:
-    """Samples CPU/RAM (psutil) and GPU (nvidia-smi) on a background thread.
+    """Samples CPU/RAM (psutil) and GPU (nvidia-smi) on a background thread."""
 
-    Uses its own "metrics" logger so probe failures (previously swallowed
-    silently) surface in the session log tagged distinctly. Pass nothing to
-    keep the old silent-by-default behaviour aside from logging: if no handler
-    is attached for the "metrics" logger, records simply go nowhere.
-    """
-
-    _log = logging.getLogger("metrics")
-
-    def __init__(self, interval=None):
-        import psutil  # noqa: F401 (stored on self._psutil, used across methods)
+    def __init__(self, interval=DEFAULT_PROBE_SEC):
+        import psutil
         self._psutil = psutil
-        if interval is None:
-            interval = DEFAULT_PROBE_SEC
         self.interval = max(1, int(interval))
         self._samples = []
         self._stop = threading.Event()
@@ -293,15 +434,14 @@ class MetricsSampler:
                         pass
             if utils:
                 return (sum(utils) / len(utils), sum(temps) / len(temps))
-        except Exception as e:
-            self._log.debug("gpu probe failed: %s", e)
+        except Exception:
+            pass
         return (None, None)
 
     def _cpu_temp(self):
         try:
             temps = self._psutil.sensors_temperatures()
-        except Exception as e:
-            self._log.debug("cpu temp probe failed: %s", e)
+        except Exception:
             return None
         if not temps:
             return None
@@ -350,3 +490,5 @@ class MetricsSampler:
 
     def collect(self):
         return list(self._samples)
+
+

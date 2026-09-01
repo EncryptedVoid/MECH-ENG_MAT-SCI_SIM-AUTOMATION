@@ -1,0 +1,4 @@
+run_id,timestamp,gpu_usage_pct,cpu_usage_pct,gpu_temp_c,cpu_temp_c,ram_usage_pct
+[FAILED]-RUN-0001-20260901111804,2026-09-01T11:18:04,,0.0,,39.2,68.8
+[FAILED]-RUN-0002-20260901111807,2026-09-01T11:18:07,,0.0,,44.0,68.8
+[FAILED]-RUN-0003-20260901111810,2026-09-01T11:18:10,,0.0,,40.8,68.3

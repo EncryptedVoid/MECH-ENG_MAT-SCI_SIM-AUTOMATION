@@ -1,0 +1,24 @@
+{
+  "session_id": "20260901111804",
+  "app_version": "0.4.0",
+  "start_utc": "2026-09-01T05:18:04Z",
+  "end_utc": "2026-09-01T05:18:12Z",
+  "duration_sec": 8.03,
+  "num_runs_planned": 3,
+  "probe_interval_sec": 60,
+  "limits": {
+    "cpu": 100.0,
+    "ram": 90.0,
+    "gpu": null
+  },
+  "hardware": {
+    "cpu_model": "12th Gen Intel(R) Core(TM) i7-12700H",
+    "cpu_cores_physical": 14,
+    "cpu_cores_logical": 20,
+    "ram_total_gb": 15.31,
+    "gpu_model": "",
+    "gpu_vram_mb": null,
+    "platform": "Linux-7.0.0-28-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3"
+  }
+}

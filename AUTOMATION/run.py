@@ -1,25 +1,56 @@
 #!/usr/bin/env python3
 """
-LAVA - LAMMPS Automation Validation Aid
-=======================================
-Step-by-step wizard to set up and run LAMMPS simulation sessions.
+LAVA — LAMMPS Automation Validation Aid (GUI + orchestration).
+==============================================================
 
-Project developed in conjunction with BUET Mechanical Engineering student
-"Kazi Rubaiyat Mustafix" and University of the People Computer Science student
-"Ashiq Arib Gazi".
+WHAT THIS FILE IS
+-----------------
+The tkinter wizard and the code that drives a run. This is the ONLY module that
+touches the GUI. It owns:
+* the App wizard — Step 0 (new session / view previous sessions), Step 1 (build
+  LAMMPS), Step 2 (choose materials, seeds, and add/edit material profiles),
+  Step 3 (configure limits, preview, and run a session);
+* the whole-window + inner scrolling machinery, logging to the on-screen log,
+  and worker threads (build, project build, session run) that must never touch
+  tkinter directly;
+* MaterialEditor, the add/edit window for a material profile set, including the
+  "contribute" flow that commits a new [UNTESTED]- profile on its own branch and
+  opens a pull request; and
+* main().
 
-Pipelines:
-  1. Selection Pipeline     - choose specific file(s) to run in combination
-                              without generating new files.
-  2. Auto-Generate Pipeline - (not built yet) using potential files,
-                              auto-generate all combinations and validate sets.
+WHERE THE OTHER LOGIC LIVES (so this file stays focused)
+-------------------------------------------------------
+* constants.py — every configuration value (colours, fonts, paths, defaults,
+  the project tree, accepted extensions, markers). Imported wholesale below.
+* helpers.py — all pure, GUI-free logic: parsers, seed parsing, filesystem and
+  session discovery, CSV I/O, hardware probes, and MetricsSampler.
+* report.py — offline HTML + PNG generation; the session worker calls
+  report.generate_session_outputs() at the end of a run.
+
+Import direction (no cycles):
+
+    constants.py  --imported by-->  helpers.py, report.py, run.py
+    helpers.py    --imported by-->  report.py, run.py
+    report.py     --imported by-->  run.py
+
+WORKING ON THIS FILE (for humans and LLMs)
+------------------------------------------
+* GUI and orchestration only. If you find yourself writing a pure parser, a
+  filesystem scan, or HTML/PNG output here, it belongs in helpers.py or
+  report.py — put it there and import it, so this file stays about the wizard.
+* Threading rule: worker threads (build/project/session) run as daemons and
+  must NEVER call tkinter directly. Talk back to the GUI only via self.log_line
+  (queued) or self.root.after(0, ...). Direct widget access off the main thread
+  crashes intermittently.
+* The sudo password handed to the build worker is used to authenticate sudo via
+  stdin and is never stored, logged, or written to disk. Keep it that way.
+* Launch:  python3 run.py   (from inside AUTOMATION/, so the flat imports of
+  constants / helpers / report resolve).
 
 All output data is CSV except config.json.
-Launch:  python3 gui.py
 """
 
 import os
-import platform
 import re
 import sys
 import csv
@@ -35,421 +66,26 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, scrolledtext
 
-# ---------------------------------------------------------------------------
-# Version / branding
-# ---------------------------------------------------------------------------
-VERSION = "0.4.0"
-APP_NAME = "LAVA"
-APP_SUBTITLE = "LAMMPS AUTOMATION VALIDATION AID"
-APP_CREDIT = ('Project developed in conjunction with BUET Mechanical Engineering '
-              'student "Kazi Rubaiyat Mustafix" and University of the People '
-              'Computer Science student "Ashiq Arib Gazi"')
-FOOTER = f"Made by ASHIQ GAZI | Ashiq.live | VERSION {VERSION}"
-LOGO_FILE = "LOGO.webp"
-
-# Volcanic / lava palette
-COL_BG = "#1a1210"
-COL_PANEL = "#241a17"
-COL_TEXT = "#f3e9e3"
-COL_MUTED = "#b08a7a"
-COL_LAVA = "#e2510f"
-COL_LAVA_HOT = "#ff7a1a"
-COL_EMBER = "#c1272d"
-COL_OK = "#3fbf6f"
-COL_WARN = "#f0b429"
-COL_ERR = "#ff5a4d"
-COL_ENTRY = "#31231f"
-
-FONT = ("TkDefaultFont", 10)
-FONT_BOLD = ("TkDefaultFont", 10, "bold")
-FONT_MONO = ("TkFixedFont", 9)
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-BUILD_SCRIPT = "setup.sh"
-LAMMPS_BUILD_ROOT = Path.home() / ".lammps-build"
-LAMMPS_BIN = LAMMPS_BUILD_ROOT / "build" / "lmp"
-CUDA_MIN = "12.8"
-CONFIG_NAME = "config.json"
-
-PROJECT_TREE = {
-    "ANALYSIS": ["SESSIONS"],
-    "AUTOMATION": [],
-    "LOGS": [],
-    "PROJECT": [],
-    "SIMULATION": ["MATERIALS"],
-    "TEMP": [],
-}
-MATERIAL_SUBDIRS = {
-    "potentials": "POTENTIAL-FILES",
-    "configs": "CONFIGURATION-FILES",
-    "structures": "STRUCTURE-FILES",
-}
-INPUT_EXT = {
-    "potentials": {".sw", ".txt", ".meam", ".eam", ".alloy", ".pot", ".tersoff"},
-    "configs": {"", ".in", ".lmp", ".txt"},
-    "structures": {".data", ".lmp", ".xyz", ".dat"},
-}
-# run output file -> renamed name in RUN folder (run.log handled separately)
-OUTPUT_RENAME = {
-    "T_profile.dat": "TEMP-PROFILE.txt",
-    "ebath.dat": "ELECTRON-BATH.txt",
-    "log.lammps": "LAMMPS.log",
-}
-
-DEFAULT_PROBE_SEC = 60
-DEFAULT_MAX_CPU = 100
-DEFAULT_MAX_RAM = 90
-DEFAULT_MAX_GPU = 100
-
-# ---------------------------------------------------------------------------
-# Pure-logic helpers
-# ---------------------------------------------------------------------------
-def now_iso() -> str:
-    return dt.datetime.now().isoformat(timespec="seconds")
-
-def now_stamp() -> str:
-    return dt.datetime.now().strftime("%Y%m%d%H%M%S")
-
-def stamp_of(ts) -> str:
-    return ts.strftime("%Y%m%d%H%M%S")
-
-def script_dir() -> Path:
-    return Path(__file__).resolve().parent
-
-def parse_seeds(spec: str):
-    """Parse 'X,Y,A-B,Z' -> sorted unique ints. Raises ValueError on bad tokens."""
-    if not spec or not spec.strip():
-        return []
-    out = set()
-    for tok in spec.split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        m = re.fullmatch(r"(\d+)\s*-\s*(\d+)", tok)
-        if m:
-            a, b = int(m.group(1)), int(m.group(2))
-            if a > b:
-                a, b = b, a
-            out.update(range(a, b + 1))
-        elif re.fullmatch(r"\d+", tok):
-            out.add(int(tok))
-        else:
-            raise ValueError(f"invalid seed token: {tok!r}")
-    return sorted(out)
-
-def have_nvidia_smi() -> bool:
-    if not shutil.which("nvidia-smi"):
-        return False
-    try:
-        subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, check=True)
-        return True
-    except Exception:
-        return False
-
-def have_psutil() -> bool:
-    try:
-        import psutil  # noqa
-        return True
-    except Exception:
-        return False
-
-def looks_like_input(path: Path, kind: str) -> bool:
-    name = path.name
-    if name.startswith(".") or name == "__init__.py":
-        return False
-    if not path.is_file():
-        return False
-    if kind == "configs" and name.startswith("in."):
-        return True
-    return path.suffix.lower() in INPUT_EXT.get(kind, set())
-
-def list_material_inputs(material_dir: Path, kind: str):
-    sub = material_dir / MATERIAL_SUBDIRS[kind]
-    if not sub.is_dir():
-        return []
-    return [p for p in sorted(sub.iterdir()) if looks_like_input(p, kind)]
-
-def discover_materials(root: Path):
-    out = {}
-    if not root.is_dir():
-        return out
-    for d in sorted(root.iterdir()):
-        if not d.is_dir():
-            continue
-        # A material folder is one that has configs AND structures. Potentials
-        # are optional (some materials run without a potential file).
-        if ((d / MATERIAL_SUBDIRS["configs"]).is_dir() and
-                (d / MATERIAL_SUBDIRS["structures"]).is_dir()):
-            out[d.name] = d
-    return out
-
-def write_csv(path: Path, fieldnames, rows):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: ("" if r.get(k) is None else r.get(k)) for k in fieldnames})
-
-def append_csv(path: Path, fieldnames, row):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    new = not path.exists()
-    with open(path, "a", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=fieldnames)
-        if new:
-            w.writeheader()
-        w.writerow({k: ("" if row.get(k) is None else row.get(k)) for k in fieldnames})
-
-def _avg(vals):
-    vals = [v for v in vals if isinstance(v, (int, float))]
-    return round(sum(vals) / len(vals), 2) if vals else None
-
-def summarize_samples(samples):
-    return {
-        "avg_gpu_usage_pct": _avg([s["gpu_usage_pct"] for s in samples]),
-        "avg_cpu_usage_pct": _avg([s["cpu_usage_pct"] for s in samples]),
-        "avg_gpu_temp_c": _avg([s["gpu_temp_c"] for s in samples]),
-        "avg_cpu_temp_c": _avg([s["cpu_temp_c"] for s in samples]),
-        "avg_ram_usage_pct": _avg([s["ram_usage_pct"] for s in samples]),
-    }
-
-
-def now_utc_iso() -> str:
-    """Current time as a UTC ISO-8601 string with a Z suffix."""
-    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def detect_hardware() -> dict:
-    """Best-effort machine specs via psutil / nvidia-smi / platform.
-
-    Any field that can't be determined is left blank/None rather than raising.
-    """
-    info = {
-        "cpu_model": "", "cpu_cores_physical": None, "cpu_cores_logical": None,
-        "ram_total_gb": None, "gpu_model": "", "gpu_vram_mb": None,
-        "platform": "", "python": "",
-    }
-    try:
-        info["platform"] = platform.platform()
-        info["python"] = platform.python_version()
-    except Exception:
-        pass
-    # CPU model name
-    try:
-        if os.path.exists("/proc/cpuinfo"):
-            for line in open("/proc/cpuinfo"):
-                if line.lower().startswith("model name"):
-                    info["cpu_model"] = line.split(":", 1)[1].strip()
-                    break
-    except Exception:
-        pass
-    if not info["cpu_model"]:
-        try:
-            info["cpu_model"] = platform.processor() or platform.machine()
-        except Exception:
-            pass
-    # cores + RAM
-    try:
-        import psutil
-        info["cpu_cores_physical"] = psutil.cpu_count(logical=False)
-        info["cpu_cores_logical"] = psutil.cpu_count(logical=True)
-        info["ram_total_gb"] = round(psutil.virtual_memory().total / (1024 ** 3), 2)
-    except Exception:
-        pass
-    # GPU model + VRAM
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.total",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10, check=True).stdout.strip()
-        if out:
-            first = out.splitlines()[0].split(",")
-            info["gpu_model"] = first[0].strip()
-            try:
-                info["gpu_vram_mb"] = int(float(first[1].strip()))
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return info
-
-
-def parse_ebath(path: Path):
-    """Parse ebath.dat / ELECTRON-BATH.txt.
-
-    Format: header line 't_ps E_hot_eV E_cold_eV' then whitespace-separated
-    numeric rows. Returns (fieldnames, list[dict])."""
-    rows = []
-    try:
-        with open(path) as fh:
-            lines = [ln.strip() for ln in fh if ln.strip()]
-    except Exception:
-        return (["t_ps", "E_hot_eV", "E_cold_eV"], [])
-    if not lines:
-        return (["t_ps", "E_hot_eV", "E_cold_eV"], [])
-    header = lines[0].split()
-    for ln in lines[1:]:
-        parts = ln.split()
-        if len(parts) != len(header):
-            continue
-        try:
-            rows.append({header[i]: float(parts[i]) for i in range(len(header))})
-        except ValueError:
-            continue
-    return (header, rows)
-
-
-def parse_tprof(path: Path):
-    """Parse T_profile.dat / TEMP-PROFILE.txt (LAMMPS ave/chunk).
-
-    Repeating blocks: a '<timestep> <nchunks> <total>' line followed by
-    <nchunks> rows of '<chunk> <coord> <ncount> <v_tatom>'. Comment lines
-    start with '#'. Empty bins (ncount==0) get temperature '' (no data).
-    Returns (fieldnames, list[dict])."""
-    out = []
-    try:
-        with open(path) as fh:
-            raw = [ln.rstrip("\r\n") for ln in fh]
-    except Exception:
-        return (["timestep", "chunk", "coord", "ncount", "temperature"], [])
-    cur_ts = None
-    expect = got = 0
-    for ln in raw:
-        s = ln.strip()
-        if not s or s.startswith("#"):
-            continue
-        parts = s.split()
-        if cur_ts is None and len(parts) == 3:
-            try:
-                cur_ts = int(float(parts[0]))
-                expect = int(parts[1])
-                got = 0
-            except ValueError:
-                cur_ts = None
-            continue
-        if cur_ts is not None and len(parts) == 4:
-            try:
-                chunk = int(parts[0])
-                coord = float(parts[1])
-                ncount = float(parts[2])
-                temp = float(parts[3])
-            except ValueError:
-                continue
-            out.append({
-                "timestep": cur_ts, "chunk": chunk, "coord": coord,
-                "ncount": ncount,
-                "temperature": ("" if ncount == 0 else temp),
-            })
-            got += 1
-            if got >= expect:
-                cur_ts = None
-    return (["timestep", "chunk", "coord", "ncount", "temperature"], out)
-
-def fmt_hms(seconds):
-    if seconds is None:
-        return "unknown"
-    seconds = int(seconds)
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    if h:
-        return f"{h}h {m}m {s}s"
-    if m:
-        return f"{m}m {s}s"
-    return f"{s}s"
-
-
-# ---------------------------------------------------------------------------
-# Metrics sampler (configurable probe interval)
-# ---------------------------------------------------------------------------
-class MetricsSampler:
-    """Samples CPU/RAM (psutil) and GPU (nvidia-smi) on a background thread."""
-
-    def __init__(self, interval=DEFAULT_PROBE_SEC):
-        import psutil
-        self._psutil = psutil
-        self.interval = max(1, int(interval))
-        self._samples = []
-        self._stop = threading.Event()
-        self._thread = None
-        self._latest = None   # most recent sample, for live limit checks
-
-    def _probe_gpu(self):
-        try:
-            out = subprocess.run(
-                ["nvidia-smi",
-                 "--query-gpu=utilization.gpu,temperature.gpu",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=10, check=True).stdout.strip()
-            utils, temps = [], []
-            for line in out.splitlines():
-                parts = [x.strip() for x in line.split(",")]
-                if len(parts) >= 2:
-                    try:
-                        utils.append(float(parts[0]))
-                        temps.append(float(parts[1]))
-                    except ValueError:
-                        pass
-            if utils:
-                return (sum(utils) / len(utils), sum(temps) / len(temps))
-        except Exception:
-            pass
-        return (None, None)
-
-    def _cpu_temp(self):
-        try:
-            temps = self._psutil.sensors_temperatures()
-        except Exception:
-            return None
-        if not temps:
-            return None
-        for key in ("coretemp", "k10temp", "cpu_thermal", "acpitz"):
-            if key in temps and temps[key]:
-                vals = [t.current for t in temps[key] if t.current is not None]
-                if vals:
-                    return sum(vals) / len(vals)
-        allv = [t.current for arr in temps.values() for t in arr if t.current is not None]
-        return sum(allv) / len(allv) if allv else None
-
-    def _sample_once(self):
-        cpu = self._psutil.cpu_percent(interval=None)
-        ram = self._psutil.virtual_memory().percent
-        gpu_util, gpu_temp = self._probe_gpu()
-        s = {
-            "timestamp": now_iso(),
-            "gpu_usage_pct": gpu_util,
-            "cpu_usage_pct": cpu,
-            "gpu_temp_c": gpu_temp,
-            "cpu_temp_c": self._cpu_temp(),
-            "ram_usage_pct": ram,
-        }
-        self._latest = s
-        return s
-
-    def _loop(self):
-        self._psutil.cpu_percent(interval=None)
-        self._samples.append(self._sample_once())
-        while not self._stop.wait(self.interval):
-            self._samples.append(self._sample_once())
-
-    def start(self):
-        self._stop.clear()
-        self._samples = []
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=5)
-
-    def latest(self):
-        return self._latest
-
-    def collect(self):
-        return list(self._samples)
+import report
+import constants as _const
+from constants import (
+    VERSION, APP_NAME, APP_SUBTITLE, APP_CREDIT, FOOTER, LOGO_FILE,
+    COL_BG, COL_PANEL, COL_TEXT, COL_MUTED, COL_LAVA, COL_LAVA_HOT,
+    COL_EMBER, COL_OK, COL_WARN, COL_ERR, COL_ENTRY,
+    FONT, FONT_BOLD, FONT_MONO,
+    BUILD_SCRIPT, LAMMPS_BUILD_ROOT, LAMMPS_BIN, CONFIG_NAME,
+    PROJECT_TREE, MATERIAL_SUBDIRS, OUTPUT_RENAME,
+    UNTESTED_PREFIX, MATERIAL_INFO_NAME, EDITOR_ROWS,
+    DEFAULT_PROBE_SEC, DEFAULT_MAX_CPU, DEFAULT_MAX_RAM, DEFAULT_MAX_GPU,
+)
+from helpers import (
+    now_iso, script_dir, repo_root,
+    is_untested_name, display_material_name, slugify, parse_seeds,
+    have_nvidia_smi, have_psutil, looks_like_input, list_material_inputs,
+    discover_materials, read_material_info, write_material_info,
+    write_csv, append_csv, summarize_samples, now_utc_iso, detect_hardware,
+    parse_ebath, parse_tprof, fmt_hms, MetricsSampler,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +98,11 @@ class App:
         root.geometry("900x760")
         root.minsize(820, 680)
         root.configure(bg=COL_BG)
+
+        # Resolve the preferred UI font (Roboto Mono) against installed families
+        # and apply it before any widgets are built; falls back to the default
+        # sans-serif if it isn't installed. See _apply_font.
+        self._apply_font()
 
         self.log_q = queue.Queue()
         self._logfile = None
@@ -480,6 +121,12 @@ class App:
 
         self.config = None
         self.config_path = None
+
+        # persisted user settings (currently: timestamp mode). Default to UTC
+        # for privacy - local timestamps in filenames can reveal a user's
+        # timezone in a shared report.
+        self._settings = self._load_settings()
+        self.use_utc = tk.BooleanVar(value=self._settings.get("use_utc", True))
 
         # session control
         self.session_thread = None
@@ -528,8 +175,155 @@ class App:
                       cursor="hand2", **kw)
         return b
 
-    def _label(self, parent, text, fg=COL_TEXT, font=FONT, **kw):
-        return tk.Label(parent, text=text, bg=parent["bg"], fg=fg, font=font, **kw)
+    def _label(self, parent, text, fg=COL_TEXT, font=None, **kw):
+        return tk.Label(parent, text=text, bg=parent["bg"], fg=fg,
+                        font=font or FONT, **kw)
+
+    # -- settings + timestamps --------------------------------------------
+    def _settings_path(self):
+        return repo_root() / "PROJECT" / "lava-settings.json"
+
+    def _load_settings(self):
+        try:
+            p = repo_root() / "PROJECT" / "lava-settings.json"
+            if p.exists():
+                return json.loads(p.read_text()) or {}
+        except Exception:
+            pass
+        return {}
+
+    def _save_settings(self):
+        try:
+            p = self._settings_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            self._settings["use_utc"] = bool(self.use_utc.get())
+            p.write_text(json.dumps(self._settings, indent=2))
+        except Exception as e:
+            self.log_line(f"Could not save settings: {e}")
+
+    def _now_dt(self):
+        """Timezone-aware 'now' honoring the user's UTC/local preference."""
+        if self.use_utc.get():
+            return dt.datetime.now(dt.timezone.utc)
+        return dt.datetime.now()
+
+    def _stamp_suffix(self):
+        """'Z' for UTC, 'L' for local - appended to every stamp so it's always
+        clear which zone a filename/id was made in, even if the user switches."""
+        return "Z" if self.use_utc.get() else "L"
+
+    def _session_stamp(self):
+        """YYYYmmddHHMMSS + Z/L suffix, honoring the timestamp preference."""
+        return self._now_dt().strftime("%Y%m%d%H%M%S") + self._stamp_suffix()
+
+    def _now_iso_pref(self):
+        """ISO 'now' honoring the preference, with an explicit zone marker."""
+        d = self._now_dt()
+        return d.isoformat(timespec="seconds")
+
+    def _apply_font(self):
+        """Apply the preferred UI font (constants.PREFERRED_FONT, i.e. Roboto
+        Mono) if available, else keep the sans-serif defaults.
+
+        Self-enclosing: the TTFs are bundled in the repo at
+        AUTOMATION/assets/fonts. tkinter can't load a .ttf by path, but on Linux
+        we can make the OS font system see it by copying it into the user font
+        dir and refreshing the fontconfig cache. So if the family isn't already
+        installed we register the bundled copy, then apply it. All best-effort:
+        if registration doesn't take (e.g. no fc-cache), we fall back cleanly.
+
+        Implementation note: the FONT tuples reference Tk's *named* fonts
+        ('TkDefaultFont', 'TkFixedFont'); reconfiguring those named fonts'
+        family changes every widget that uses them (including ttk) with no other
+        rebinding.
+        """
+        import tkinter.font as tkfont
+        want = getattr(_const, "PREFERRED_FONT", "")
+        if not want:
+            return
+
+        def families():
+            try:
+                return set(tkfont.families(self.root))
+            except Exception:
+                return set()
+
+        if want not in families():
+            # try to register the bundled TTFs, then re-check
+            if self._register_bundled_font():
+                # fontconfig was refreshed, but this already-running Tk may have
+                # cached the old family list; families() usually still picks it
+                # up. If not, we fall through to the graceful message.
+                pass
+
+        if want not in families():
+            self.root.after(
+                0, lambda: self.log_line(
+                    f"Font '{want}' not available yet; using the default "
+                    f"sans-serif. It should apply next launch (the bundled "
+                    f"font was registered)."))
+            return
+
+        for name in ("TkDefaultFont", "TkTextFont", "TkFixedFont",
+                     "TkMenuFont", "TkHeadingFont", "TkTooltipFont"):
+            try:
+                tkfont.nametofont(name).configure(family=want)
+            except Exception:
+                pass
+
+        # Widgets pass explicit font tuples like ("TkDefaultFont", 10); Tk reads
+        # the first element as a FAMILY name, so reconfiguring the named default
+        # font is not enough - we must rebuild the FONT tuples with the real
+        # resolved family and rebind them in this module's globals (and in
+        # constants) so every `font=FONT` call picks up the change.
+        size = getattr(_const, "FONT_SIZE", 10)
+        size_mono = getattr(_const, "FONT_SIZE_MONO", 9)
+        new_font = (want, size)
+        new_bold = (want, size, "bold")
+        new_mono = (want, size_mono)
+        globals()["FONT"] = new_font
+        globals()["FONT_BOLD"] = new_bold
+        globals()["FONT_MONO"] = new_mono
+        _const.FONT = new_font
+        _const.FONT_BOLD = new_bold
+        _const.FONT_MONO = new_mono
+
+        self.root.after(0, lambda: self.log_line(f"UI font: {want}"))
+
+    def _register_bundled_font(self):
+        """Copy the bundled Roboto Mono TTFs into the user font dir and refresh
+        the fontconfig cache so the OS (and thus tkinter) can see them. Linux/
+        WSL only; returns True if it attempted registration. Best-effort."""
+        src_dir = script_dir() / "assets" / "fonts"
+        if not src_dir.is_dir():
+            return False
+        ttfs = sorted(src_dir.glob("*.ttf"))
+        if not ttfs:
+            return False
+        try:
+            dest = Path.home() / ".local" / "share" / "fonts" / "LAVA"
+            dest.mkdir(parents=True, exist_ok=True)
+            copied = False
+            for f in ttfs:
+                target = dest / f.name
+                if not target.exists():
+                    shutil.copy2(f, target)
+                    copied = True
+            # refresh fontconfig if available (harmless if it isn't)
+            if shutil.which("fc-cache"):
+                subprocess.run(["fc-cache", "-f", str(dest)],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=30)
+            if copied:
+                self.root.after(
+                    0, lambda: self.log_line(
+                        "Registered bundled Roboto Mono into the user font "
+                        "directory."))
+            return True
+        except Exception as e:
+            msg = f"Could not register bundled font: {e}"
+            self.root.after(0, lambda: self.log_line(msg))
+            return False
 
     # -- shell (logo header, body container, footer, log) ------------------
     def _build_shell(self):
@@ -546,9 +340,39 @@ class App:
         tk.Label(titlebox, text=APP_SUBTITLE, bg=COL_BG, fg=COL_MUTED,
                  font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
 
-        # body container (each step frame packs in here)
-        self.container = tk.Frame(self.root, bg=COL_BG)
-        self.container.pack(fill="both", expand=True)
+        # breadcrumb bar - populated per step via _set_breadcrumb; lets the user
+        # jump back to Home or an earlier step.
+        self.crumb_bar = tk.Frame(self.root, bg=COL_PANEL)
+        self.crumb_bar.pack(fill="x", side="top")
+
+        # body: a scrollable viewport. self.container is the inner frame that
+        # each step attaches to (unchanged from a step's point of view); the
+        # canvas + scrollbar give the whole window its own scroll when a step's
+        # content overflows. Inner boxes (material list, preview) keep their own
+        # scroll regions - the wheel dispatcher routes to whichever region the
+        # pointer is over.
+        body = tk.Frame(self.root, bg=COL_BG)
+        body.pack(fill="both", expand=True)
+        self._body_canvas = tk.Canvas(body, bg=COL_BG, highlightthickness=0)
+        self._body_sb = ttk.Scrollbar(body, orient="vertical",
+                                       command=self._body_canvas.yview)
+        self.container = tk.Frame(self._body_canvas, bg=COL_BG)
+        self._body_win = self._body_canvas.create_window(
+            (0, 0), window=self.container, anchor="nw")
+        self._body_canvas.configure(yscrollcommand=self._on_body_scroll)
+        self._body_canvas.pack(side="left", fill="both", expand=True)
+        # scrollbar is packed/unpacked on demand by _on_body_scroll
+        self.container.bind(
+            "<Configure>",
+            lambda e: self._body_canvas.configure(
+                scrollregion=self._body_canvas.bbox("all")))
+        self._body_canvas.bind(
+            "<Configure>",
+            lambda e: self._body_canvas.itemconfigure(self._body_win,
+                                                      width=e.width))
+        # one wheel dispatcher for the whole app (routes by pointer location)
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.root.bind_all(seq, self._on_mousewheel, add="+")
 
         # log area
         logframe = tk.LabelFrame(self.root, text="Log", bg=COL_BG, fg=COL_MUTED,
@@ -566,11 +390,71 @@ class App:
         tk.Label(footer, text=FOOTER, bg=COL_BG, fg=COL_MUTED,
                  font=("TkDefaultFont", 9)).pack(side="right", padx=10, pady=4)
 
+    # -- scrolling ---------------------------------------------------------
+    def _on_body_scroll(self, first, last):
+        """yscrollcommand for the window viewport: show the scrollbar only when
+        the content actually overflows, hide it when everything fits."""
+        self._body_sb.set(first, last)
+        try:
+            fits = float(first) <= 0.0 and float(last) >= 1.0
+        except ValueError:
+            fits = True
+        if fits:
+            self._body_sb.pack_forget()
+        elif not self._body_sb.winfo_ismapped():
+            self._body_sb.pack(side="right", fill="y")
+
+    def _register_scrollable(self, canvas):
+        """Inner scroll regions register here so the wheel dispatcher can route
+        to them when the pointer is over them."""
+        if not hasattr(self, "_inner_scrollables"):
+            self._inner_scrollables = []
+        self._inner_scrollables.append(canvas)
+
+    def _on_mousewheel(self, event):
+        """Single wheel handler for the app. Scrolls the inner scroll region the
+        pointer is over if it actually overflows; otherwise scrolls the window
+        viewport, but only when the page itself overflows. Short pages that fit
+        entirely do not scroll at all."""
+        if getattr(event, "num", None) == 4:
+            delta = -1
+        elif getattr(event, "num", None) == 5:
+            delta = 1
+        else:
+            delta = -1 if getattr(event, "delta", 0) > 0 else 1
+
+        def overflowing(canvas):
+            # yview() == (0.0, 1.0) means everything is visible -> nothing to
+            # scroll. Treat tiny float error tolerantly.
+            try:
+                first, last = canvas.yview()
+                return not (first <= 0.0001 and last >= 0.9999)
+            except Exception:
+                return False
+
+        # prune dead widgets, then prefer an inner region under the pointer
+        live = []
+        for c in getattr(self, "_inner_scrollables", []):
+            try:
+                if c.winfo_exists():
+                    live.append(c)
+            except Exception:
+                pass
+        self._inner_scrollables = live
+        for c in live:
+            if self._pointer_in(c):
+                if overflowing(c):
+                    c.yview_scroll(delta, "units")
+                return   # pointer is over this region; don't fall through
+        # otherwise scroll the window viewport only if the page overflows
+        if overflowing(self._body_canvas):
+            self._body_canvas.yview_scroll(delta, "units")
+
     def _load_logo(self, parent):
         """Load a logo next to this script. Tries LOGO.webp/.png/.jpg/.jpeg.
         PNG/GIF load natively in tk; JPEG/WEBP use Pillow if available.
         Falls back to a lava glyph if nothing loads."""
-        base = script_dir()
+        base = script_dir() / "assets" / "logos"
         candidates = [LOGO_FILE, "LOGO.png", "LOGO.jpg", "LOGO.jpeg", "LOGO.gif"]
         for name in candidates:
             p = base / name
@@ -607,7 +491,7 @@ class App:
 
     def _set_window_icon(self):
         """Set the taskbar / titlebar icon from the logo file (best-effort)."""
-        base = script_dir()
+        base = script_dir() / "assets" / "logos"
         for name in (LOGO_FILE, "LOGO.png", "LOGO.jpg", "LOGO.jpeg", "LOGO.gif"):
             p = base / name
             if not p.exists():
@@ -681,16 +565,49 @@ class App:
     def _clear_container(self):
         for w in self.container.winfo_children():
             w.destroy()
+        # forget any inner scroll regions from the step we're leaving
+        self._inner_scrollables = []
+        # new steps start scrolled to the top
+        try:
+            self._body_canvas.yview_moveto(0.0)
+        except Exception:
+            pass
 
     def _new_step(self):
         f = tk.Frame(self.container, bg=COL_BG)
         f.pack(fill="both", expand=True)
         return f
 
+    def _set_breadcrumb(self, crumbs):
+        """Render the top breadcrumb. crumbs is a list of (label, callback):
+        a callback of None means the current (non-clickable) page. Always keeps
+        a Home entry first unless the caller already provided one."""
+        for w in self.crumb_bar.winfo_children():
+            w.destroy()
+        if not crumbs or crumbs[0][0] != "Home":
+            crumbs = [("Home", self.show_step0)] + list(crumbs)
+        row = tk.Frame(self.crumb_bar, bg=COL_PANEL)
+        row.pack(anchor="w", padx=12, pady=5)
+        for i, (label, cb) in enumerate(crumbs):
+            if i:
+                tk.Label(row, text="  \u203a  ", bg=COL_PANEL, fg=COL_MUTED,
+                         font=FONT).pack(side="left")
+            last = (i == len(crumbs) - 1)
+            if cb is None or last:
+                tk.Label(row, text=label, bg=COL_PANEL,
+                         fg=(COL_LAVA_HOT if last else COL_MUTED),
+                         font=FONT_BOLD if last else FONT).pack(side="left")
+            else:
+                lb = tk.Label(row, text=label, bg=COL_PANEL, fg=COL_LAVA,
+                              font=FONT, cursor="hand2")
+                lb.pack(side="left")
+                lb.bind("<Button-1>", lambda e, c=cb: c())
+
     def _step_header(self, parent, step_no, title, subtitle=""):
-        tk.Label(parent, text=f"STEP {step_no}", bg=COL_BG, fg=COL_LAVA,
-                 font=("TkDefaultFont", 9, "bold")).pack(anchor="w", padx=14,
-                                                         pady=(10, 0))
+        if step_no != "":
+            tk.Label(parent, text=f"STEP {step_no}", bg=COL_BG, fg=COL_LAVA,
+                     font=("TkDefaultFont", 9, "bold")).pack(anchor="w", padx=14,
+                                                             pady=(10, 0))
         tk.Label(parent, text=title, bg=COL_BG, fg=COL_TEXT,
                  font=("TkDefaultFont", 16, "bold")).pack(anchor="w", padx=14)
         if subtitle:
@@ -699,78 +616,198 @@ class App:
                                                           pady=(2, 8))
 
     # ======================================================================
-    # STEP 0 - choose pipeline
+    # HOME - setup / start session / view past sessions
     # ======================================================================
+    def _valid_build_exists(self):
+        """True if a usable LAMMPS binary is present. We only check that the
+        binary exists and is executable - confirming it has specific packages
+        would require launching it, which we don't do on every home render."""
+        try:
+            return LAMMPS_BIN.exists() and os.access(LAMMPS_BIN, os.X_OK)
+        except Exception:
+            return False
+
     def show_step0(self):
+        self._set_breadcrumb([("Home", None)])
         self._clear_container()
         f = self._new_step()
-        self._step_header(f, 0, "Choose a pipeline",
-                          "Pick which pipeline to run.")
+        self._step_header(f, "", "LAVA",
+                          "Set up your LAMMPS build once, then run sessions and "
+                          "browse past reports.")
 
-        # credit line
         tk.Label(f, text=APP_CREDIT, bg=COL_BG, fg=COL_MUTED, font=FONT,
                  wraplength=840, justify="left").pack(anchor="w", padx=14,
-                                                      pady=(0, 10))
+                                                      pady=(0, 8))
+
+        have_build = self._valid_build_exists()
+
+        # build-status banner
+        banner = tk.Frame(f, bg=COL_PANEL, highlightthickness=1,
+                          highlightbackground=(COL_OK if have_build else COL_ERR))
+        banner.pack(fill="x", padx=14, pady=(0, 10))
+        if have_build:
+            tk.Label(banner, text="APPROPRIATE BUILD FOUND - PLEASE WORK FREELY",
+                     bg=COL_PANEL, fg=COL_OK, font=FONT_BOLD).pack(
+                anchor="w", padx=10, pady=8)
+        else:
+            tk.Label(banner, text="NO APPROPRIATE BUILD OF LAMMPS FOUND - PLEASE "
+                     "BUILD LAMMPS BEFORE WORKING", bg=COL_PANEL, fg=COL_ERR,
+                     font=FONT_BOLD).pack(anchor="w", padx=10, pady=8)
 
         cards = tk.Frame(f, bg=COL_BG)
         cards.pack(anchor="w", padx=14, pady=6, fill="x")
 
-        pipelines = [
-            (1, "Selection Pipeline",
-             "Choose the specific file(s) that should be run in combination "
-             "without generating new files.", True),
-            (2, "Auto-Generate Pipeline",
-             "Using potential files, auto-generate all combinations and "
-             "validate sets.", False),
-            (3, "Headless Run",
-             "Run specifically chosen combinations headless for remote "
-             "execution.", False),
+        # (title, desc, command, enabled)
+        choices = [
+            ("SETUP LAMMPS BUILD",
+             "Build a LAMMPS binary matched to this machine. This is a one-time "
+             "step (re-run it only to rebuild or upgrade). Everything else stays "
+             "locked until a valid build exists.",
+             self.show_step1, True),
+            ("START SESSION",
+             "Choose the materials and files to run, then execute every "
+             "potential x configuration x structure x seed combination per "
+             "material.",
+             self._start_new_session, have_build),
+            ("VIEW PAST SESSIONS",
+             "Browse every session already run in this project and open its "
+             "report.",
+             self.show_previous_sessions, have_build),
         ]
-        for num, name, desc, ready in pipelines:
+        for name, desc, cmd, enabled in choices:
+            edge = COL_LAVA if enabled else "#3a2a24"
             card = tk.Frame(cards, bg=COL_PANEL, bd=0, highlightthickness=1,
-                            highlightbackground=COL_LAVA if ready else "#3a2a24")
+                            highlightbackground=edge)
             card.pack(fill="x", pady=5)
             inner = tk.Frame(card, bg=COL_PANEL)
             inner.pack(fill="x", padx=12, pady=10)
-            top = tk.Frame(inner, bg=COL_PANEL)
-            top.pack(fill="x")
-            tk.Label(top, text=f"PIPELINE {num}", bg=COL_PANEL, fg=COL_LAVA,
-                     font=("TkDefaultFont", 9, "bold")).pack(side="left")
-            if not ready:
-                tk.Label(top, text="  \u2014 coming soon", bg=COL_PANEL,
-                         fg=COL_MUTED, font=FONT).pack(side="left")
-            tk.Label(inner, text=name, bg=COL_PANEL, fg=COL_TEXT,
+            tk.Label(inner, text=name, bg=COL_PANEL,
+                     fg=(COL_TEXT if enabled else COL_MUTED),
                      font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
             tk.Label(inner, text=desc, bg=COL_PANEL, fg=COL_MUTED, font=FONT,
                      wraplength=760, justify="left").pack(anchor="w", pady=(2, 6))
-            btn = self._btn(inner, f"Use Pipeline {num}",
-                            (lambda n=num: self._pick_pipeline(n)),
-                            kind="primary" if ready else "ghost")
-            btn.pack(anchor="w")
+            if enabled:
+                self._btn(inner, name, cmd, kind="primary").pack(anchor="w")
+            else:
+                self._btn(inner, name + "  (build required)", None,
+                          kind="ghost", state="disabled").pack(anchor="w")
 
-    def _pick_pipeline(self, num):
-        if num == 1:
-            self.pipeline = 1
-            self.log_line("Selection Pipeline selected.")
-            self.show_step1()
-        elif num == 2:
-            messagebox.showinfo("Coming soon",
-                                "The Auto-Generate Pipeline is not built yet.\n\n"
-                                "Please use the Selection Pipeline for now.")
-        elif num == 3:
-            messagebox.showinfo("Coming soon",
-                                "Headless Run is not built yet.\n\n"
-                                "It will support running pre-chosen combinations "
-                                "headless via:\n"
-                                "  python3 gui.py --pipeline=3 "
-                                "--session-id=combination.headless.json\n\n"
-                                "Pause / resume / skip / stop are not available in "
-                                "headless mode by design.")
+    def _start_new_session(self):
+        if not self._valid_build_exists():
+            messagebox.showwarning("Build required",
+                                   "Set up a LAMMPS build first.")
+            return
+        self.pipeline = 1
+        self.log_line("New session selected.")
+        self.show_step2()
+
+    # ======================================================================
+    # VIEW PAST SESSIONS - render HISTORICAL.csv; double-click opens the folder
+    # ======================================================================
+    def show_previous_sessions(self):
+        self._set_breadcrumb([("Past sessions", None)])
+        self._clear_container()
+        f = self._new_step()
+        self._step_header(
+            f, "", "Past sessions",
+            "This is the session history from ANALYSIS/HISTORICAL.csv.")
+
+        # help text about the double-click action
+        tk.Label(f, text="\u2139  Double-click a row to open that session's "
+                 "folder (report, CSVs, logs and graphs).",
+                 bg=COL_BG, fg=COL_LAVA_HOT, font=FONT_BOLD).pack(
+            anchor="w", padx=14, pady=(0, 6))
+
+        hist = repo_root() / "ANALYSIS" / "HISTORICAL.csv"
+        if not hist.exists():
+            tk.Label(f, text="No HISTORICAL.csv yet - run a session first.",
+                     bg=COL_BG, fg=COL_MUTED, font=FONT).pack(anchor="w",
+                                                              padx=14, pady=10)
+            return
+
+        try:
+            with open(hist, newline="") as fh:
+                reader = csv.reader(fh)
+                rows = list(reader)
+        except Exception as e:
+            tk.Label(f, text=f"Could not read HISTORICAL.csv: {e}", bg=COL_BG,
+                     fg=COL_ERR, font=FONT).pack(anchor="w", padx=14, pady=10)
+            return
+        if not rows:
+            tk.Label(f, text="HISTORICAL.csv is empty.", bg=COL_BG, fg=COL_MUTED,
+                     font=FONT).pack(anchor="w", padx=14, pady=10)
+            return
+
+        header, data = rows[0], rows[1:]
+        # find the session-id column so we can resolve each row's folder
+        sid_idx = None
+        for i, h in enumerate(header):
+            if h.strip().lower() in ("session_id", "session", "id"):
+                sid_idx = i
+                break
+
+        wrap = tk.Frame(f, bg=COL_PANEL)
+        wrap.pack(fill="x", padx=14, pady=(0, 6))
+        tree = ttk.Treeview(wrap, columns=[f"c{i}" for i in range(len(header))],
+                            show="headings", height=14, selectmode="browse")
+        for i, h in enumerate(header):
+            tree.heading(f"c{i}", text=h)
+            tree.column(f"c{i}", width=max(90, min(240, len(h) * 12)),
+                        anchor="w")
+        for r in data:
+            # pad/truncate row to header length
+            vals = (r + [""] * len(header))[:len(header)]
+            tree.insert("", "end", values=vals)
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        def on_double(_ev):
+            item = tree.focus()
+            if not item:
+                return
+            vals = tree.item(item, "values")
+            sid = None
+            if sid_idx is not None and sid_idx < len(vals):
+                sid = str(vals[sid_idx]).strip()
+            if not sid:
+                messagebox.showinfo(
+                    "No session id",
+                    "This row has no session id column, so its folder can't be "
+                    "located automatically.")
+                return
+            sessions = repo_root() / "ANALYSIS" / "SESSIONS"
+            folder = sessions / f"SESSION-{sid}"
+            if not folder.is_dir():
+                # stopped sessions have their folder tagged with -[ABORTED]
+                aborted = sessions / f"SESSION-{sid}-[ABORTED]"
+                if aborted.is_dir():
+                    folder = aborted
+                else:
+                    messagebox.showwarning(
+                        "Folder not found",
+                        f"No folder for session {sid} at:\n{folder}")
+                    return
+            self.log_line(f"Opening session folder {folder}")
+            self._open_in_file_manager(folder)
+
+        tree.bind("<Double-1>", on_double)
+
+    def _open_report(self, report_path: Path):
+        p = Path(report_path)
+        if not p.exists():
+            messagebox.showwarning("No report",
+                                   f"Report file not found:\n{p}")
+            return
+        self.log_line(f"Opening report {p}")
+        self._open_in_file_manager(p)
 
     # ======================================================================
     # STEP 1 - set up LAMMPS (build via script, sudo password from GUI)
     # ======================================================================
     def show_step1(self):
+        self._set_breadcrumb([("Setup LAMMPS build", None)])
         self._clear_container()
         f = self._new_step()
         self._step_header(
@@ -791,6 +828,20 @@ class App:
                        bg=COL_BG, fg=COL_TEXT, selectcolor=COL_ENTRY,
                        activebackground=COL_BG, activeforeground=COL_TEXT,
                        font=FONT).pack(anchor="w")
+
+        # one-time timestamp preference (persisted). UTC is the privacy-safe
+        # default: local timestamps in filenames can reveal your timezone in a
+        # shared report. Stamps are suffixed Z (UTC) or L (local) so it's always
+        # clear which a given file used, even if you switch later.
+        tsbox = tk.Frame(f, bg=COL_BG)
+        tsbox.pack(anchor="w", padx=14, pady=(10, 0))
+        tk.Checkbutton(
+            tsbox, text="Use UTC timestamps in filenames and reports "
+            "(recommended - avoids revealing your timezone; suffix Z=UTC, "
+            "L=local)", variable=self.use_utc, command=self._save_settings,
+            bg=COL_BG, fg=COL_TEXT, selectcolor=COL_ENTRY,
+            activebackground=COL_BG, activeforeground=COL_TEXT, font=FONT,
+            wraplength=800, justify="left", anchor="w").pack(anchor="w")
 
         # sudo password entry
         pwbox = tk.Frame(f, bg=COL_BG)
@@ -815,10 +866,11 @@ class App:
         self.build_btn.grid(row=0, column=0, padx=(0, 8))
         self._btn(bar, "Verify build", self._verify_build).grid(row=0, column=1,
                                                                 padx=8)
-        self._btn(bar, "Back", self.show_step0, kind="ghost").grid(row=0, column=2,
-                                                                   padx=8)
-        self.step1_next = self._btn(bar, "Next  \u2192", self.show_step2,
-                                    kind="primary")
+        self._btn(bar, "\u2190 Home", self.show_step0, kind="ghost").grid(
+            row=0, column=2, padx=8)
+        # once a build exists, offer to go straight to a new session
+        self.step1_next = self._btn(bar, "Start a session  \u2192",
+                                    self._start_new_session, kind="primary")
         self.step1_next.grid(row=0, column=3, padx=8)
         self.step1_next.configure(state="disabled")
 
@@ -965,112 +1017,84 @@ class App:
             return -1
 
     # ======================================================================
-    # STEP 2 - project root, material sources, seeds, per-material file select
+    # STEP 2 - seeds + per-material file selection (root fixed to the repo)
     # ======================================================================
     def show_step2(self):
+        self._set_breadcrumb([("New session", self._start_new_session), ("Choose materials", None)])
         self._clear_container()
         f = self._new_step()
+
+        # Root and materials source are no longer chosen by the user: the
+        # project root is the repo (one level above AUTOMATION/), and materials
+        # always live in ROOT/SIMULATION/MATERIALS. Inter-material mixing is not
+        # allowed - combinations are computed per material only.
+        root = repo_root()
+        self.project_root.set(str(root))
+        materials_root = root / "SIMULATION" / "MATERIALS"
+        materials_root.mkdir(parents=True, exist_ok=True)
+        self.materials_src.set(str(materials_root))
+
         self._step_header(
-            f, 2, "Set up the project",
-            "Choose a project root and a materials source folder. Each material "
-            "is its own subfolder (e.g. Zinc-Oxide/POTENTIAL-FILES, "
-            "CONFIGURATION-FILES, STRUCTURE-FILES). Tick the files to include per "
-            "material - untick any you don't want. Set seeds as X,Y,A-B,Z. "
-            "Selected files are copied into the project tree and saved to "
-            "config.json.")
+            f, 2, "Choose materials & seeds",
+            f"Project root: {root}\n"
+            f"Materials: {materials_root}\n"
+            "Set the seeds to run, tick the files to include per material, or add "
+            "a new material profile. Each material's runs are its own "
+            "potential x configuration x structure x seed combinations - "
+            "materials are never mixed together.")
 
+        # --- top: seed bar --------------------------------------------------
         top = tk.Frame(f, bg=COL_BG)
-        top.pack(anchor="w", padx=14, fill="x")
-
-        def _row(r, label, var, cmd):
-            tk.Label(top, text=label, bg=COL_BG, fg=COL_TEXT, font=FONT,
-                     width=16, anchor="w").grid(row=r, column=0, sticky="w", pady=4)
-            tk.Entry(top, textvariable=var, width=54, bg=COL_ENTRY, fg=COL_TEXT,
-                     insertbackground=COL_TEXT, relief="flat").grid(
-                row=r, column=1, padx=6)
-            self._btn(top, "Browse", cmd).grid(row=r, column=2)
-
-        _row(0, "Project root", self.project_root, self._pick_project_root)
-        _row(1, "Materials source", self.materials_src, self._pick_materials_src)
-        _row(2, "Temp folder", self.temp_dir, self._pick_temp_dir)
-        tk.Label(top, text="(temp optional - defaults to <root>/TEMP)", bg=COL_BG,
-                 fg=COL_MUTED, font=FONT).grid(row=3, column=1, sticky="w")
-
-        tk.Label(top, text="Seeds", bg=COL_BG, fg=COL_TEXT, font=FONT, width=16,
-                 anchor="w").grid(row=4, column=0, sticky="w", pady=4)
-        tk.Entry(top, textvariable=self.seed_spec, width=54, bg=COL_ENTRY,
-                 fg=COL_TEXT, insertbackground=COL_TEXT, relief="flat").grid(
-            row=4, column=1, padx=6)
+        top.pack(anchor="w", padx=14, fill="x", pady=(0, 4))
+        tk.Label(top, text="Seeds", bg=COL_BG, fg=COL_TEXT, font=FONT_BOLD,
+                 width=8, anchor="w").pack(side="left")
+        tk.Entry(top, textvariable=self.seed_spec, width=40, bg=COL_ENTRY,
+                 fg=COL_TEXT, insertbackground=COL_TEXT, relief="flat").pack(
+            side="left", padx=6)
         tk.Label(top, text="e.g. 1,3,5-8", bg=COL_BG, fg=COL_MUTED,
-                 font=FONT).grid(row=4, column=2, sticky="w")
+                 font=FONT).pack(side="left")
 
-        # scrollable area for per-material file checkboxes
         tk.Label(f, text="Materials & files", bg=COL_BG, fg=COL_LAVA_HOT,
                  font=FONT_BOLD).pack(anchor="w", padx=14, pady=(10, 2))
 
-        # Pin the action bar to the BOTTOM first, so the expanding material
-        # area below can never push it off-screen (this was the overflow bug).
-        bar = tk.Frame(f, bg=COL_BG)
-        bar.pack(side="bottom", anchor="w", padx=14, pady=10, fill="x")
-        self._btn(bar, "Back", self.show_step1, kind="ghost").grid(
-            row=0, column=0, padx=(0, 8))
-        self.build_project_btn = self._btn(
-            bar, "Build project + save config", self._build_project, kind="primary")
-        self.build_project_btn.grid(row=0, column=1, padx=8)
-
-        # The material area fills whatever space is left between the fields above
-        # and the pinned bar below, and scrolls internally if it overflows.
+        # --- per-material asset lists (this box scrolls internally; the whole
+        #     window also scrolls if the page overflows) ---------------------
         self.mat_area = tk.Frame(f, bg=COL_PANEL)
-        self.mat_area.pack(fill="both", expand=True, padx=14, pady=(0, 6))
-        self._mat_placeholder = tk.Label(
-            self.mat_area, text="Choose a materials source folder to list "
-            "materials and files.", bg=COL_PANEL, fg=COL_MUTED, font=FONT)
-        self._mat_placeholder.pack(anchor="w", padx=10, pady=10)
+        self.mat_area.pack(fill="x", padx=14, pady=(0, 6))
 
         # holds {material: {kind: {filename: BooleanVar}}}
         self.file_vars = {}
+        self._populate_materials()
 
-        # if the materials source is already set, populate now
-        if self.materials_src.get().strip():
-            self._populate_materials()
-
-    def _pick_project_root(self):
-        d = filedialog.askdirectory(title="Choose PROJECT ROOT")
-        if d:
-            self.project_root.set(d)
-            cfg = Path(d) / "PROJECT" / CONFIG_NAME
-            if cfg.exists() and messagebox.askyesno(
-                    "Project already set up",
-                    "This project already has a config.json.\n\nSkip setup and go "
-                    "straight to running?"):
-                self.load_config_and_run(cfg)
-
-    def _pick_materials_src(self):
-        d = filedialog.askdirectory(title="Choose materials source folder")
-        if d:
-            self.materials_src.set(d)
-            self._populate_materials()
-
-    def _pick_temp_dir(self):
-        d = filedialog.askdirectory(title="Choose TEMP folder")
-        if d:
-            self.temp_dir.set(d)
+        # --- action bar at the natural end of the flow ----------------------
+        bar = tk.Frame(f, bg=COL_BG)
+        bar.pack(anchor="w", padx=14, pady=10, fill="x")
+        self._btn(bar, "\u2190 Back", self.show_step1, kind="ghost").grid(
+            row=0, column=0, padx=(0, 8))
+        self._btn(bar, "+ Add material profile",
+                  self._add_material_profile).grid(row=0, column=1, padx=8)
+        self.build_project_btn = self._btn(
+            bar, "Build project + save config", self._build_project, kind="primary")
+        self.build_project_btn.grid(row=0, column=2, padx=8)
 
     def _populate_materials(self):
         for w in self.mat_area.winfo_children():
             w.destroy()
         self.file_vars = {}
+        self.mat_select_vars = {}   # material -> master select BooleanVar
         src = Path(self.materials_src.get().strip())
         materials = discover_materials(src)
         if not materials:
             tk.Label(self.mat_area,
-                     text="No materials found. Expected subfolders each "
-                     "containing POTENTIAL-FILES / CONFIGURATION-FILES / "
-                     "STRUCTURE-FILES.", bg=COL_PANEL, fg=COL_ERR,
-                     font=FONT).pack(anchor="w", padx=10, pady=10)
+                     text="No materials found in SIMULATION/MATERIALS yet. Use "
+                     "\u201c+ Add material profile\u201d below to create one.",
+                     bg=COL_PANEL, fg=COL_MUTED, font=FONT,
+                     wraplength=800, justify="left").pack(anchor="w", padx=10,
+                                                          pady=10)
             return
 
-        canvas = tk.Canvas(self.mat_area, bg=COL_PANEL, highlightthickness=0)
+        canvas = tk.Canvas(self.mat_area, bg=COL_PANEL, highlightthickness=0,
+                           height=300)
         sb = ttk.Scrollbar(self.mat_area, orient="vertical", command=canvas.yview)
         inner = tk.Frame(canvas, bg=COL_PANEL)
         win = canvas.create_window((0, 0), window=inner, anchor="nw")
@@ -1083,45 +1107,98 @@ class App:
         canvas.configure(yscrollcommand=sb.set)
         canvas.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-
-        # mousewheel scrolling while the pointer is over the list
-        def _wheel(e):
-            delta = -1 if getattr(e, "delta", 0) > 0 else 1
-            if getattr(e, "num", None) == 4:
-                delta = -1
-            elif getattr(e, "num", None) == 5:
-                delta = 1
-            canvas.yview_scroll(delta, "units")
-        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            canvas.bind_all(seq, lambda e: _wheel(e)
-                            if self._pointer_in(canvas) else None)
+        # register so the app-wide wheel dispatcher scrolls this list when the
+        # pointer is over it (window scrolls otherwise)
+        self._register_scrollable(canvas)
 
         for mat, mdir in materials.items():
             self.file_vars[mat] = {}
-            block = tk.Frame(inner, bg=COL_PANEL)
-            block.pack(fill="x", anchor="w", pady=(6, 2))
-            tk.Label(block, text=mat, bg=COL_PANEL, fg=COL_LAVA_HOT,
-                     font=FONT_BOLD).pack(anchor="w")
+            info = read_material_info(mdir)
+            untested = is_untested_name(mat) or not info.get("tested", True)
+            block = tk.Frame(inner, bg=COL_PANEL, highlightthickness=1,
+                             highlightbackground="#3a2a24")
+            block.pack(fill="x", anchor="w", pady=4)
+
+            # title row: expander + master checkbox + name + tag + Edit
+            titlerow = tk.Frame(block, bg=COL_PANEL)
+            titlerow.pack(fill="x", anchor="w")
+
+            # details frame (per-file checkboxes) starts collapsed
+            details = tk.Frame(block, bg=COL_PANEL)
+
+            exp_var = tk.BooleanVar(value=False)
+            exp_btn = tk.Label(titlerow, text="\u25B6", bg=COL_PANEL,
+                               fg=COL_LAVA_HOT, font=FONT_BOLD, cursor="hand2",
+                               width=2)
+            exp_btn.pack(side="left", padx=(6, 0))
+
+            def _toggle_expand(m=mat, d=details, b=exp_btn, ev=exp_var):
+                if ev.get():
+                    d.pack_forget(); b.configure(text="\u25B6"); ev.set(False)
+                else:
+                    d.pack(fill="x", anchor="w", padx=(24, 6), pady=(0, 6))
+                    b.configure(text="\u25BC"); ev.set(True)
+            exp_btn.bind("<Button-1>", lambda e, fn=_toggle_expand: fn())
+
+            # master checkbox: ticks/unticks every file in this material at once
+            mat_var = tk.BooleanVar(value=True)
+            mat_cb = tk.Checkbutton(
+                titlerow, variable=mat_var, bg=COL_PANEL, selectcolor=COL_ENTRY,
+                activebackground=COL_PANEL,
+                command=lambda m=mat: self._toggle_material(m))
+            mat_cb.pack(side="left")
+            self.mat_select_vars[mat] = mat_var
+
+            # clicking the name also expands/collapses (bigger hit target)
+            name_lbl = tk.Label(titlerow, text=display_material_name(mat),
+                                bg=COL_PANEL, fg=COL_LAVA_HOT, font=FONT_BOLD,
+                                cursor="hand2")
+            name_lbl.pack(side="left")
+            name_lbl.bind("<Button-1>", lambda e, fn=_toggle_expand: fn())
+
+            if untested:
+                tk.Label(titlerow, text="  \u26A0 UNTESTED",
+                         bg=COL_PANEL, fg=COL_WARN, font=FONT_BOLD).pack(
+                    side="left")
+            self._btn(titlerow, "Edit",
+                      lambda m=mat, d=mdir: self._edit_material_profile(m, d),
+                      kind="ghost").pack(side="right", padx=(0, 6))
+
+            # a small hint of how many files, shown while collapsed
+            counts = {k: len(list_material_inputs(mdir, k))
+                      for k in ("potentials", "configs", "structures")}
+            tk.Label(titlerow,
+                     text=f"  {counts['potentials']}p \u00b7 {counts['configs']}c "
+                          f"\u00b7 {counts['structures']}s",
+                     bg=COL_PANEL, fg=COL_MUTED, font=FONT).pack(side="left")
+
+            if untested:
+                desc = info.get("description", "")
+                msg = ("Contributed by a user and not validated. You may run it, "
+                       "but some or all combinations may fail.")
+                if desc:
+                    msg += f" Note: {desc}"
+                tk.Label(details, text=msg, bg=COL_PANEL, fg=COL_MUTED, font=FONT,
+                         wraplength=780, justify="left").pack(anchor="w")
+
             for kind in ("potentials", "configs", "structures"):
                 files = list_material_inputs(mdir, kind)
                 self.file_vars[mat][kind] = {}
                 if not files:
                     if kind == "potentials":
-                        tk.Label(block, text="   potentials: (none - runs will "
-                                 "execute without a potential file)",
-                                 bg=COL_PANEL, fg=COL_MUTED, font=FONT).pack(
-                            anchor="w")
+                        tk.Label(details, text="potentials: (none - runs execute "
+                                 "without a potential file)", bg=COL_PANEL,
+                                 fg=COL_MUTED, font=FONT).pack(anchor="w")
                     else:
-                        tk.Label(block, text=f"   {kind}: (none found - required)",
+                        tk.Label(details, text=f"{kind}: (none found - required)",
                                  bg=COL_PANEL, fg=COL_ERR, font=FONT).pack(
                             anchor="w")
                     continue
-                row = tk.Frame(block, bg=COL_PANEL)
+                row = tk.Frame(details, bg=COL_PANEL)
                 row.pack(fill="x", anchor="w")
                 tk.Label(row, text=f"{kind}:", bg=COL_PANEL, fg=COL_MUTED,
                          font=FONT, width=12, anchor="nw").pack(side="left",
                                                                 anchor="n")
-                # checkboxes wrap within the available width
                 cbwrap = tk.Frame(row, bg=COL_PANEL)
                 cbwrap.pack(side="left", fill="x", expand=True)
                 for fp in files:
@@ -1131,7 +1208,37 @@ class App:
                                    fg=COL_TEXT, selectcolor=COL_ENTRY,
                                    activebackground=COL_PANEL,
                                    activeforeground=COL_TEXT, font=FONT,
-                                   anchor="w").pack(side="top", anchor="w")
+                                   anchor="w",
+                                   command=lambda m=mat:
+                                       self._refresh_material_master(m)).pack(
+                        side="top", anchor="w")
+
+    def _iter_material_file_vars(self, mat):
+        """Yield every file BooleanVar for a material, across all kinds."""
+        for kind_vars in self.file_vars.get(mat, {}).values():
+            for v in kind_vars.values():
+                yield v
+
+    def _toggle_material(self, mat):
+        """Master checkbox handler: set every file in this material to match."""
+        want = self.mat_select_vars[mat].get()
+        for v in self._iter_material_file_vars(mat):
+            v.set(want)
+
+    def _refresh_material_master(self, mat):
+        """Keep the master checkbox in sync when files are toggled by hand:
+        ticked only if every file is ticked (unticked if any is off)."""
+        vals = [v.get() for v in self._iter_material_file_vars(mat)]
+        master = self.mat_select_vars.get(mat)
+        if master is not None and vals:
+            master.set(all(vals))
+
+    def _add_material_profile(self):
+        MaterialEditor(self, Path(self.materials_src.get().strip()))
+
+    def _edit_material_profile(self, mat, mdir):
+        MaterialEditor(self, Path(self.materials_src.get().strip()),
+                       existing_name=mat, existing_dir=mdir)
 
     @staticmethod
     def _pointer_in(widget):
@@ -1186,6 +1293,7 @@ class App:
 
             materials = discover_materials(src)
             selected = {}   # material -> {kind: [names]}
+            untested = {}   # material -> contributor description (untested only)
             for mat, mdir in materials.items():
                 sel = {k: self._selected_files(mat, k)
                        for k in ("potentials", "configs", "structures")}
@@ -1199,6 +1307,9 @@ class App:
                     self.log_line(f"  {mat}: no potential files - runs will execute "
                                   f"without a potential.")
                 selected[mat] = sel
+                info = read_material_info(mdir)
+                if is_untested_name(mat) or not info.get("tested", True):
+                    untested[mat] = info.get("description", "")
                 for kind in ("potentials", "configs", "structures"):
                     dest = materials_root / mat / MATERIAL_SUBDIRS[kind]
                     dest.mkdir(parents=True, exist_ok=True)
@@ -1210,6 +1321,14 @@ class App:
                                 shutil.copy2(srcf, dstf)
                         except Exception as e:
                             self.log_line(f"    WARN copy {name}: {e}")
+                # carry the material metadata alongside the copied files
+                src_info = mdir / MATERIAL_INFO_NAME
+                dst_info = materials_root / mat / MATERIAL_INFO_NAME
+                try:
+                    if src_info.exists() and src_info.resolve() != dst_info.resolve():
+                        shutil.copy2(src_info, dst_info)
+                except Exception:
+                    pass
                 self.log_line(f"  {mat}: "
                               f"{len(sel['potentials'])}p x "
                               f"{len(sel['configs'])}c x "
@@ -1234,6 +1353,7 @@ class App:
                 "seeds": seeds,
                 "materials_root": str(materials_root),
                 "materials": selected,
+                "untested_materials": untested,
                 "paths": {
                     "sessions": str(root / "ANALYSIS" / "SESSIONS"),
                     "logs": str(root / "LOGS"),
@@ -1318,11 +1438,12 @@ class App:
         return runs
 
     def show_step3(self):
+        self._set_breadcrumb([("New session", self._start_new_session), ("Choose materials", self.show_step2), ("Run session", None)])
         self._clear_container()
         f = self._new_step()
         self.planned_runs = self._plan_runs()
         total = len(self.planned_runs)
-        mats = list(self.config["materials"].keys())
+        mats = [display_material_name(m) for m in self.config["materials"].keys()]
 
         self._step_header(
             f, 3, "Run a session",
@@ -1330,6 +1451,22 @@ class App:
             f"Materials: {', '.join(mats)}   Seeds: "
             f"{','.join(map(str, self.config.get('seeds', [])))}\n"
             f"This session will run {total} combination(s).")
+
+        # untested community-profile warning
+        untested = self.config.get("untested_materials", {})
+        if untested:
+            names = ", ".join(display_material_name(m) for m in untested)
+            warn = tk.Frame(f, bg=COL_PANEL, highlightthickness=1,
+                            highlightbackground=COL_WARN)
+            warn.pack(anchor="w", padx=14, pady=(0, 6), fill="x")
+            tk.Label(warn, text=f"\u26A0 UNTESTED community profile(s): {names}",
+                     bg=COL_PANEL, fg=COL_WARN, font=FONT_BOLD).pack(
+                anchor="w", padx=8, pady=(6, 0))
+            tk.Label(warn, text="These profiles were contributed by users and "
+                     "have not been validated as fully functional. You may run "
+                     "them, but some or all of their combinations may fail.",
+                     bg=COL_PANEL, fg=COL_MUTED, font=FONT, wraplength=800,
+                     justify="left").pack(anchor="w", padx=8, pady=(0, 6))
 
         # metrics prereq
         self.has_psutil = have_psutil()
@@ -1391,7 +1528,7 @@ class App:
         # read-only preview of planned runs
         prev = tk.LabelFrame(f, text="Runs to execute (preview)", bg=COL_BG,
                              fg=COL_MUTED, font=FONT)
-        prev.pack(anchor="w", padx=14, pady=(4, 6), fill="both", expand=True)
+        prev.pack(anchor="w", padx=14, pady=(4, 6), fill="x")
         cols = ("idx", "material", "potential", "configuration", "structure", "seed")
         self.preview = ttk.Treeview(prev, columns=cols, show="headings", height=7)
         headings = {"idx": "#", "material": "Material", "potential": "Potential",
@@ -1402,10 +1539,17 @@ class App:
         for c in cols:
             self.preview.heading(c, text=headings[c])
             self.preview.column(c, width=widths[c], anchor="w")
+        # row states used to show progress while the session runs
+        self.preview.tag_configure("active", background=COL_LAVA,
+                                   foreground=COL_TEXT)
+        self.preview.tag_configure("done", foreground=COL_MUTED)
+        self.preview.tag_configure("pending", foreground=COL_TEXT)
+        self._preview_items = []
         for i, r in enumerate(self.planned_runs, 1):
-            self.preview.insert("", "end", values=(
+            iid = self.preview.insert("", "end", tags=("pending",), values=(
                 i, r["material"], r["potential"] if r["potential"] else "none",
                 r["configuration"], r["structure"], r["seed"]))
+            self._preview_items.append(iid)
         self.preview.pack(fill="both", expand=True, side="left")
         psb = ttk.Scrollbar(prev, orient="vertical", command=self.preview.yview)
         psb.pack(side="right", fill="y")
@@ -1498,6 +1642,32 @@ class App:
             self.skip_event.set()   # unblock a running proc
             self.log_line("Stop requested.")
 
+    def _mark_preview_run(self, idx):
+        """Mark run #idx (1-based) as active in the preview, everything before
+        it as done, everything after as pending. Runs on the main thread."""
+        def _apply():
+            items = getattr(self, "_preview_items", [])
+            for n, iid in enumerate(items, start=1):
+                if n < idx:
+                    tag = "done"
+                elif n == idx:
+                    tag = "active"
+                else:
+                    tag = "pending"
+                self.preview.item(iid, tags=(tag,))
+            if 0 < idx <= len(items):
+                self.preview.see(items[idx - 1])
+        self.root.after(0, _apply)
+
+    def _clear_preview_highlight(self):
+        """Drop the active highlight at session end; done rows stay marked."""
+        def _apply():
+            items = getattr(self, "_preview_items", [])
+            for iid in items:
+                if "active" in self.preview.item(iid, "tags"):
+                    self.preview.item(iid, tags=("done",))
+        self.root.after(0, _apply)
+
     def _set_status(self, text):
         self.root.after(0, lambda: self.status_lbl.configure(text=text))
 
@@ -1521,8 +1691,7 @@ class App:
             runs = self.planned_runs
             total = len(runs)
 
-            session_dt = dt.datetime.now()
-            session_id = stamp_of(session_dt)
+            session_id = self._session_stamp()   # e.g. 20250101120000Z
             session_dir = root / "ANALYSIS" / "SESSIONS" / f"SESSION-{session_id}"
             runs_dir = session_dir / "RUNS"
             runs_dir.mkdir(parents=True, exist_ok=True)
@@ -1602,11 +1771,11 @@ class App:
                 seed = spec["seed"]
                 pot_label = spec["potential"] if has_pot else "none"
 
-                run_dt = dt.datetime.now()
-                run_stamp = stamp_of(run_dt)
+                run_stamp = self._session_stamp()
                 run_base = f"RUN-{idx:04d}-{run_stamp}"
 
                 self.root.after(0, lambda i=idx, t=total: self._update_progress(i, t))
+                self._mark_preview_run(idx)
                 self._set_status(
                     f"Run {idx}/{total}  [{mat}]  pot={pot_label}  "
                     f"conf={spec['configuration']}  struct={spec['structure']}  "
@@ -1702,6 +1871,7 @@ class App:
                 self._update_eta(idx, total)
 
             # session done
+            self._clear_preview_highlight()
             session_dur = round(time.time() - session_start, 2)
             self.log_line(f"SESSION SUMMARY -> {session_csv}")
             self.log_line(f"SESSION HW-STATS -> {hw_csv}")
@@ -1722,8 +1892,11 @@ class App:
                 shutil.rmtree(d, ignore_errors=True)
 
             # generate outputs (report / PNGs) per the user's Step 3 choices
-            self._generate_session_outputs(session_dir, session_id, session_csv,
-                                           hw_csv)
+            want_html = bool(getattr(self, "gen_html", None) and self.gen_html.get())
+            want_png = bool(getattr(self, "gen_png", None) and self.gen_png.get())
+            report.generate_session_outputs(
+                session_dir, session_id, session_csv, hw_csv,
+                want_html, want_png, self.log_line)
 
             if self.stop_event.is_set():
                 self.log_line("=== SESSION stopped ===")
@@ -1736,6 +1909,22 @@ class App:
             self.log_line(f"ERROR during session: {e}")
         finally:
             self._close_session_logfile()
+            # If the user stopped the session, tag its folder so it is obvious
+            # on disk and in the previous-sessions view. Done last, after the
+            # log file inside the folder is closed, so the rename can't fail on
+            # an open handle. Folder contents keep the plain <id>.
+            if self.stop_event.is_set():
+                cur = getattr(self, "last_session_dir", None)
+                if cur is not None:
+                    cur = Path(cur)
+                    aborted = cur.with_name(cur.name + "-[ABORTED]")
+                    try:
+                        if cur.is_dir() and not aborted.exists():
+                            cur.rename(aborted)
+                            self.last_session_dir = aborted
+                            self.log_line(f"Session folder renamed -> {aborted.name}")
+                    except Exception as e:
+                        self.log_line(f"(could not rename aborted session folder: {e})")
             self.root.after(0, self._reset_session_buttons)
 
     def _run_proc(self, cmd, work, limits, sampler):
@@ -1922,618 +2111,450 @@ class App:
         except Exception:
             pass
 
-    # ======================================================================
-    # STEP 4 - post-processing / report generation (auto at session end)
-    # ======================================================================
-    def _generate_session_outputs(self, session_dir, session_id, summary_csv,
-                                   hw_csv):
-        """Generate the HTML report and/or PNG graphs per the Step 3 choices."""
-        want_html = bool(getattr(self, "gen_html", None) and self.gen_html.get())
-        want_png = bool(getattr(self, "gen_png", None) and self.gen_png.get())
-        if not want_html and not want_png:
-            return
 
-        # read the summary rows
-        summary = []
+# ---------------------------------------------------------------------------
+# Material profile editor (add / edit a material profile set)
+# EDITOR_ROWS is imported from constants (maps each editor row to a subdir kind).
+# ---------------------------------------------------------------------------
+class MaterialEditor:
+    """Modal-ish window to create or edit one material profile set.
+
+    Same view for both: when editing, the name/description and the three file
+    lists are pre-filled from the existing material folder; when adding, they
+    start empty. Files are gathered from anywhere on the filesystem via the
+    ADD ASSETS dialog (repeatable, multi-select) and shown as removable chips.
+
+    On save, the material folder is written under materials_root with the three
+    POTENTIAL/STRUCTURE/CONFIGURATION subdirs and a MATERIAL-INFO.json. "Save +
+    Contribute" additionally commits the folder (prefixed [UNTESTED]-) on its
+    own branch and opens a pull request.
+    """
+
+    def __init__(self, app, materials_root: Path, existing_name=None,
+                 existing_dir=None):
+        self.app = app
+        # The materials root is always ROOT/SIMULATION/MATERIALS. Derive it from
+        # the repo rather than trusting a caller-supplied value, which can be an
+        # empty StringVar if the editor is opened before Step 2 has populated it
+        # (that previously wrote new materials into the current directory).
+        mr = Path(materials_root) if materials_root else None
+        if not mr or str(mr) in ("", "."):
+            mr = repo_root() / "SIMULATION" / "MATERIALS"
+        mr.mkdir(parents=True, exist_ok=True)
+        self.materials_root = mr
+        self.existing_name = existing_name
+        self.existing_dir = Path(existing_dir) if existing_dir else None
+        # kind -> list[str] of absolute source paths chosen for that row
+        self.picked = {kind: [] for kind, _ in EDITOR_ROWS}
+        self._chip_frames = {}
+
+        self.win = tk.Toplevel(app.root)
+        self.win.title("Edit material profile" if existing_name
+                       else "Add material profile")
+        self.win.configure(bg=COL_BG)
+        self.win.geometry("720x640")
+        self.win.transient(app.root)
+
+        self.name_var = tk.StringVar()
+        self.desc_var = tk.StringVar()
+        self.contribute_var = tk.BooleanVar(value=False)
+
+        self._build_ui()
+        if existing_name and self.existing_dir:
+            self._prefill_from_existing()
+
+    # -- UI ----------------------------------------------------------------
+    def _build_ui(self):
+        # top: name + description
+        top = tk.Frame(self.win, bg=COL_BG)
+        top.pack(fill="x", padx=14, pady=(12, 6))
+        tk.Label(top, text="Material name", bg=COL_BG, fg=COL_TEXT,
+                 font=FONT_BOLD, width=16, anchor="w").grid(row=0, column=0,
+                                                            sticky="w", pady=3)
+        tk.Entry(top, textvariable=self.name_var, width=46, bg=COL_ENTRY,
+                 fg=COL_TEXT, insertbackground=COL_TEXT, relief="flat").grid(
+            row=0, column=1, sticky="w", padx=6)
+        tk.Label(top, text="(unique, descriptive)", bg=COL_BG, fg=COL_MUTED,
+                 font=FONT).grid(row=0, column=2, sticky="w")
+        tk.Label(top, text="Description", bg=COL_BG, fg=COL_TEXT, font=FONT,
+                 width=16, anchor="w").grid(row=1, column=0, sticky="w", pady=3)
+        tk.Entry(top, textvariable=self.desc_var, width=46, bg=COL_ENTRY,
+                 fg=COL_TEXT, insertbackground=COL_TEXT, relief="flat").grid(
+            row=1, column=1, sticky="w", padx=6)
+        tk.Label(top, text="(optional)", bg=COL_BG, fg=COL_MUTED,
+                 font=FONT).grid(row=1, column=2, sticky="w")
+
+        # three asset rows live in a scrollable middle area so the top fields
+        # and the bottom actions stay put no matter how many chips are added.
+        mid = tk.Frame(self.win, bg=COL_BG)
+        mid.pack(fill="both", expand=True, padx=14, pady=4)
+        ecanvas = tk.Canvas(mid, bg=COL_BG, highlightthickness=0)
+        esb = ttk.Scrollbar(mid, orient="vertical", command=ecanvas.yview)
+        body = tk.Frame(ecanvas, bg=COL_BG)
+        ewin = ecanvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>",
+                  lambda e: ecanvas.configure(scrollregion=ecanvas.bbox("all")))
+        ecanvas.bind("<Configure>",
+                     lambda e: ecanvas.itemconfigure(ewin, width=e.width))
+        ecanvas.configure(yscrollcommand=esb.set)
+        ecanvas.pack(side="left", fill="both", expand=True)
+        esb.pack(side="right", fill="y")
+        # wheel scrolling while the pointer is over the editor's asset area
+        def _ewheel(e):
+            if getattr(e, "num", None) == 4:
+                d = -1
+            elif getattr(e, "num", None) == 5:
+                d = 1
+            else:
+                d = -1 if getattr(e, "delta", 0) > 0 else 1
+            if App._pointer_in(ecanvas):
+                ecanvas.yview_scroll(d, "units")
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.win.bind(seq, _ewheel)
+
+        for kind, label in EDITOR_ROWS:
+            block = tk.LabelFrame(body, text=label, bg=COL_BG, fg=COL_LAVA_HOT,
+                                  font=FONT_BOLD)
+            block.pack(fill="x", pady=6)
+            head = tk.Frame(block, bg=COL_BG)
+            head.pack(fill="x", padx=6, pady=4)
+            self.app._btn(head, "ADD ASSETS",
+                          lambda k=kind: self._add_assets(k),
+                          kind="primary").pack(side="left")
+            tk.Label(head, text="  browse anywhere; select several at once, or "
+                     "click again to add more", bg=COL_BG, fg=COL_MUTED,
+                     font=FONT).pack(side="left")
+            chips = tk.Frame(block, bg=COL_PANEL)
+            chips.pack(fill="x", padx=6, pady=(0, 6))
+            self._chip_frames[kind] = chips
+            self._render_chips(kind)
+
+        # contribute + actions (fixed at the bottom, never scrolls away)
+        bottom = tk.Frame(self.win, bg=COL_BG)
+        bottom.pack(fill="x", side="bottom", padx=14, pady=(4, 12))
+        tk.Checkbutton(bottom, text="Also contribute this profile to the shared "
+                       "repository (opens a pull request; marked UNTESTED until "
+                       "CI validates it)", variable=self.contribute_var,
+                       bg=COL_BG, fg=COL_TEXT, selectcolor=COL_ENTRY,
+                       activebackground=COL_BG, activeforeground=COL_TEXT,
+                       font=FONT, wraplength=660, justify="left",
+                       anchor="w").pack(anchor="w", pady=(0, 6))
+        actions = tk.Frame(bottom, bg=COL_BG)
+        actions.pack(fill="x")
+        self.app._btn(actions, "Cancel", self.win.destroy,
+                      kind="ghost").pack(side="left")
+        self.save_btn = self.app._btn(actions, "Save", self._save,
+                                      kind="primary")
+        self.save_btn.pack(side="right")
+
+    def _render_chips(self, kind):
+        frame = self._chip_frames[kind]
+        for w in frame.winfo_children():
+            w.destroy()
+        if not self.picked[kind]:
+            tk.Label(frame, text="(no files added yet)", bg=COL_PANEL,
+                     fg=COL_MUTED, font=FONT).pack(anchor="w", padx=4, pady=2)
+            return
+        for path in list(self.picked[kind]):
+            chip = tk.Frame(frame, bg=COL_ENTRY)
+            chip.pack(side="top", anchor="w", fill="x", pady=1)
+            bad = not looks_like_input(Path(path), kind)
+            tk.Label(chip, text=Path(path).name, bg=COL_ENTRY,
+                     fg=COL_WARN if bad else COL_TEXT, font=FONT).pack(
+                side="left", padx=(6, 4))
+            if bad:
+                tk.Label(chip, text="(unexpected type)", bg=COL_ENTRY,
+                         fg=COL_WARN, font=FONT).pack(side="left")
+            tk.Button(chip, text="\u2715", command=lambda p=path, k=kind:
+                      self._remove_asset(k, p), bg=COL_ENTRY, fg=COL_ERR,
+                      relief="flat", bd=0, font=FONT_BOLD, cursor="hand2").pack(
+                side="right", padx=6)
+
+    # -- asset add/remove --------------------------------------------------
+    def _add_assets(self, kind):
+        paths = filedialog.askopenfilenames(
+            parent=self.win,
+            title=f"Add {dict(EDITOR_ROWS)[kind]}")
+        if not paths:
+            return
+        for p in paths:
+            if p not in self.picked[kind]:
+                self.picked[kind].append(p)
+        self._render_chips(kind)
+
+    def _remove_asset(self, kind, path):
         try:
-            with open(summary_csv) as fh:
-                summary = list(csv.DictReader(fh))
+            self.picked[kind].remove(path)
+        except ValueError:
+            pass
+        self._render_chips(kind)
+
+    def _prefill_from_existing(self):
+        info = read_material_info(self.existing_dir)
+        self.name_var.set(display_material_name(self.existing_name))
+        self.desc_var.set(info.get("description", ""))
+        for kind, _ in EDITOR_ROWS:
+            for fp in list_material_inputs(self.existing_dir, kind):
+                self.picked[kind].append(str(fp))
+            self._render_chips(kind)
+
+    # -- validation + save -------------------------------------------------
+    def _validate(self):
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showwarning("Missing name",
+                                   "Give the material a unique name.",
+                                   parent=self.win)
+            return None
+        if not self.picked["configs"] or not self.picked["structures"]:
+            messagebox.showwarning(
+                "Missing files",
+                "A material needs at least one CONFIGURATION/INPUT file and one "
+                "STRUCTURE file. Potentials are optional.", parent=self.win)
+            return None
+        # extension check across all rows
+        bad = []
+        for kind, _ in EDITOR_ROWS:
+            for p in self.picked[kind]:
+                if not looks_like_input(Path(p), kind):
+                    bad.append(Path(p).name)
+        if bad:
+            listed = ", ".join(bad[:8]) + (" ..." if len(bad) > 8 else "")
+            if not messagebox.askyesno(
+                    "Unrecognized file types",
+                    f"These files don't match the known extensions for their "
+                    f"category:\n\n{listed}\n\nThey may not be valid LAMMPS "
+                    f"inputs, and this session may not work. Continue anyway?",
+                    parent=self.win):
+                return None
+        return name
+
+    def _save(self):
+        name = self._validate()
+        if name is None:
+            return
+        contribute = self.contribute_var.get()
+        try:
+            dest_dir = self._write_material(name, tested=not contribute)
         except Exception as e:
-            self.log_line(f"Report: could not read summary CSV ({e})")
+            messagebox.showerror("Save failed", str(e), parent=self.win)
+            return
+        self.app.log_line(f"Saved material profile -> {dest_dir}")
+        if contribute:
+            # run the git flow off the UI thread; it may be slow or fail on a
+            # bad connection, and must never block or crash the GUI.
+            threading.Thread(target=self._contribute_worker,
+                             args=(name, dest_dir), daemon=True).start()
+        self.win.destroy()
+        self.app._populate_materials()
+
+    def _write_material(self, name, tested):
+        """Create/refresh the material folder under materials_root.
+
+        Contributed (untested) profiles get the [UNTESTED]- name prefix so the
+        rest of the app and CI can recognize them. Returns the folder path."""
+        folder = name if tested else f"{UNTESTED_PREFIX}{name}"
+        dest = self.materials_root / folder
+
+        # If editing an existing folder whose name is unchanged, write in place;
+        # otherwise create the new folder fresh.
+        dest.mkdir(parents=True, exist_ok=True)
+        for kind, _ in EDITOR_ROWS:
+            sub = dest / MATERIAL_SUBDIRS[kind]
+            sub.mkdir(parents=True, exist_ok=True)
+            wanted = {Path(p).name for p in self.picked[kind]}
+            # remove files that were deleted in the editor
+            for existing in list(sub.iterdir()) if sub.is_dir() else []:
+                if existing.is_file() and existing.name not in wanted:
+                    try:
+                        existing.unlink()
+                    except Exception:
+                        pass
+            # copy in the chosen files (skip self-copies)
+            for p in self.picked[kind]:
+                srcf = Path(p)
+                dstf = sub / srcf.name
+                try:
+                    if srcf.resolve() != dstf.resolve():
+                        shutil.copy2(srcf, dstf)
+                except Exception as e:
+                    self.app.log_line(f"    WARN copy {srcf.name}: {e}")
+        write_material_info(dest, {
+            "name": name,
+            "description": self.desc_var.get().strip(),
+            "tested": tested,
+            "contributed_utc": now_utc_iso() if not tested else None,
+        })
+        return dest
+
+    # -- contribute (git branch + push + PR) -------------------------------
+    def _contribute_worker(self, name, dest_dir: Path):
+        """Contribute the saved material as a new branch + PR WITHOUT disturbing
+        the user's working directory or current branch.
+
+        The material folder was already written into the user's working tree by
+        _write_material and must stay there (visible and runnable locally). So
+        instead of switching branches in place - which would make the folder's
+        on-disk presence depend on the checked-out branch and can make it vanish
+        - we create a temporary detached `git worktree`, copy the material into
+        it, commit + push from there, then remove the worktree. The user's real
+        working tree is never touched.
+        """
+        root = repo_root()
+        slug = slugify(name)
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
+        branch = f"material/{slug}-{stamp}"
+        log = self.app.log_line
+
+        rel = None
+        try:
+            if dest_dir.is_relative_to(root):
+                rel = dest_dir.relative_to(root)
+        except Exception:
+            rel = None
+
+        def git(args, cwd=root, check=True):
+            return subprocess.run(["git", "-C", str(cwd), *args],
+                                  capture_output=True, text=True, check=check)
+
+        log(f"--- Contributing '{name}' as branch {branch} ---")
+        if not (root / ".git").exists():
+            log("    Not a git repository - the profile is saved locally only.")
+            return
+        if rel is None:
+            log("    Material is outside the repo - saved locally, not "
+                "contributed.")
             return
 
-        n_ok = sum(1 for r in summary if r["status"] == "OK")
-        n_fail = sum(1 for r in summary if r["status"] == "FAILED")
-        n_abort = sum(1 for r in summary if r["status"] == "ABORTED_EARLY")
-
-        # load SESSION-INFO.json (hardware + timing) if present
-        session_info = {}
+        wt_dir = root / ".git" / "lava-contrib" / slug
+        created_wt = False
         try:
-            info_path = session_dir / f"SESSION-INFO_{session_id}.json"
-            if info_path.exists():
-                with open(info_path) as fh:
-                    session_info = json.load(fh)
-        except Exception:
-            session_info = {}
+            # temporary worktree on a fresh branch off current HEAD
+            wt_dir.parent.mkdir(parents=True, exist_ok=True)
+            if wt_dir.exists():
+                shutil.rmtree(wt_dir, ignore_errors=True)
+            git(["worktree", "add", "-b", branch, str(wt_dir), "HEAD"])
+            created_wt = True
 
-        if want_html:
-            try:
-                self._build_html_report(session_dir, session_id, summary, hw_csv,
-                                        n_ok, n_fail, n_abort, session_info)
-            except Exception as e:
-                self.log_line(f"Report: HTML generation failed ({e})")
+            # copy the material folder into the worktree at the same rel path
+            target = wt_dir / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=True)
+            shutil.copytree(dest_dir, target)
 
-        if want_png:
-            try:
-                self._build_png_graphs(session_dir, session_id, summary, hw_csv,
-                                       n_ok)
-            except Exception as e:
-                self.log_line(f"Report: PNG generation failed ({e})")
-
-    def _plotly_js(self) -> str:
-        """Return the Plotly library JS to inline for fully-offline reports.
-
-        Order of preference:
-          1. plotly.min.js cached next to the app (fastest, offline).
-          2. The copy bundled inside the `plotly` PyPI package, if installed.
-          3. A one-time CDN download, cached for next time.
-          4. Empty string -> caller falls back to a CDN <script> tag.
-        """
-        cache = script_dir() / "plotly.min.js"
-        if cache.exists():
-            try:
-                return cache.read_text(encoding="utf-8")
-            except Exception:
-                pass
-        # bundled inside the plotly package
-        try:
-            import plotly
-            import glob
-            base = os.path.dirname(plotly.__file__)
-            hits = glob.glob(os.path.join(base, "**", "plotly.min.js"),
-                             recursive=True)
-            if hits:
-                data = Path(hits[0]).read_text(encoding="utf-8")
+            git(["add", str(rel)], cwd=wt_dir)
+            git(["commit", "-m", f"Add UNTESTED community material profile: {name}"],
+                cwd=wt_dir)
+            log("    Committed. Pushing (this may take a moment on a slow "
+                "connection)...")
+            push = git(["push", "-u", "origin", branch], cwd=wt_dir, check=False)
+            if push.returncode != 0:
+                log("    Push failed - the profile is saved locally and the "
+                    "branch is committed; you may lack push access or network.")
+                log(f"    git push: {push.stderr.strip()[:400]}")
+                return
+            log("    Pushed. Opening a pull request...")
+            self._open_pull_request(root, branch, name)
+        except subprocess.CalledProcessError as e:
+            log(f"    git error: {(e.stderr or str(e)).strip()[:400]} "
+                f"(profile is still saved locally)")
+        except Exception as e:
+            log(f"    Contribution failed: {e} (profile is still saved locally)")
+        finally:
+            # always remove the temporary worktree; never touches the user's tree
+            if created_wt:
                 try:
-                    cache.write_text(data, encoding="utf-8")   # cache for speed
+                    git(["worktree", "remove", "--force", str(wt_dir)], check=False)
                 except Exception:
                     pass
-                return data
+            shutil.rmtree(wt_dir, ignore_errors=True)
+            # remove the parent holder dir if it's now empty
+            try:
+                wt_dir.parent.rmdir()
+            except Exception:
+                pass
+
+    def _open_pull_request(self, root: Path, branch: str, name: str):
+        """Open a PR via the gh CLI if available/authenticated; otherwise open
+        the GitHub 'compare' page in a browser for the user to click through."""
+        log = self.app.log_line
+        title = f"[UNTESTED] Community material profile: {name}"
+        body = ("Automated contribution from LAVA. This material profile has "
+                "not been validated. CI should run every combination and only "
+                "allow merge if all runs succeed.")
+        if shutil.which("gh"):
+            pr = subprocess.run(
+                ["gh", "pr", "create", "--head", branch, "--title", title,
+                 "--body", body],
+                cwd=str(root), capture_output=True, text=True)
+            if pr.returncode == 0:
+                log(f"    Pull request opened: {pr.stdout.strip()}")
+                return
+            log("    gh could not open the PR automatically; falling back to "
+                "the browser.")
+        # browser fallback: build a compare URL from origin
+        url = self._compare_url(root, branch)
+        if url:
+            log(f"    Open this URL to finish the pull request:\n    {url}")
+            try:
+                import webbrowser
+                webbrowser.open(url)
+            except Exception:
+                pass
+        else:
+            log("    Branch pushed. Open a pull request for it on GitHub "
+                "manually.")
+
+    @staticmethod
+    def _compare_url(root: Path, branch: str):
+        try:
+            r = subprocess.run(["git", "-C", str(root), "remote", "get-url",
+                                "origin"], capture_output=True, text=True,
+                               check=True)
+            remote = r.stdout.strip()
+            # normalize git@github.com:owner/repo.git and https forms
+            m = re.search(r"github\.com[:/]+([^/]+)/(.+?)(?:\.git)?$", remote)
+            if not m:
+                return None
+            owner, repo = m.group(1), m.group(2)
+            return (f"https://github.com/{owner}/{repo}/compare/"
+                    f"{branch}?expand=1")
         except Exception:
-            pass
-        # one-time CDN download
-        url = "https://cdn.plot.ly/plotly-2.35.2.min.js"
-        try:
-            import urllib.request
-            self.log_line("Report: downloading Plotly for offline reports "
-                          "(one-time)...")
-            with urllib.request.urlopen(url, timeout=30) as resp:
-                data = resp.read().decode("utf-8")
-            cache.write_text(data, encoding="utf-8")
-            return data
-        except Exception as e:
-            self.log_line(f"Report: could not fetch Plotly ({e}); report will "
-                          f"reference the CDN and need internet to view.")
-            return ""
+            return None
 
-    def _run_color(self, i):
-        """Deterministic color per run index for the HW-stats bands/legend."""
-        palette = ["#e2510f", "#f0b429", "#3fbf6f", "#4aa3df", "#c1272d",
-                   "#9b59b6", "#1abc9c", "#e67e22", "#2ecc71", "#e74c3c"]
-        return palette[i % len(palette)]
 
-    def _build_html_report(self, session_dir, session_id, summary, hw_csv,
-                           n_ok, n_fail, n_abort, session_info=None):
-        report_path = session_dir / f"REPORT_{session_id}.html"
-        session_info = session_info or {}
-
-        # Insufficient-data case: no successful runs -> default template.
-        if n_ok == 0:
-            html = self._html_no_data(session_id, n_fail, n_abort, session_info)
-            report_path.write_text(html, encoding="utf-8")
-            self.log_line(f"REPORT (no data) -> {report_path}")
-            return
-
-        # read HW stats
-        hw_rows = []
-        try:
-            with open(hw_csv) as fh:
-                hw_rows = list(csv.DictReader(fh))
-        except Exception:
-            pass
-
-        plotly = self._plotly_js()
-        plotly_tag = (f"<script>{plotly}</script>" if plotly else
-                      '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js">'
-                      '</script>')
-
-        # Build HW-stats figures (two: temps, usage) with per-run color bands.
-        hw_traces_temp, hw_traces_use, shapes, run_spans = self._hw_figures(
-            hw_rows, summary)
-
-        # Build per-run data (tprof/ebath) for successful runs.
-        runs_dir = session_dir / "RUNS"
-        per_run = self._per_run_payload(summary, runs_dir)
-
-        import json as _json
-        payload = {
-            "session_id": session_id,
-            "hw_temp": hw_traces_temp,
-            "hw_use": hw_traces_use,
-            "hw_shapes": shapes,
-            "run_spans": run_spans,
-            "per_run": per_run,
-        }
-        data_json = _json.dumps(payload)
-
-        html = self._html_template(session_id, summary, n_ok, n_fail, n_abort,
-                                   plotly_tag, data_json, session_info)
-        report_path.write_text(html, encoding="utf-8")
-        self.log_line(f"REPORT -> {report_path}")
-
-    def _hw_figures(self, hw_rows, summary):
-        """Turn HW-stats rows into Plotly trace dicts plus per-run color bands.
-
-        Returns (temp_traces, usage_traces, shapes, run_spans)."""
-        # group probe rows by run_id, preserving order
-        from collections import OrderedDict
-        by_run = OrderedDict()
-        for r in hw_rows:
-            by_run.setdefault(r["run_id"], []).append(r)
-
-        # x axis = probe index across the whole session (simple, monotonic)
-        temp_cpu_x, temp_cpu_y = [], []
-        temp_gpu_x, temp_gpu_y = [], []
-        use_cpu_x, use_cpu_y = [], []
-        use_gpu_x, use_gpu_y = [], []
-        use_ram_x, use_ram_y = [], []
-        shapes = []
-        run_spans = []
-        idx = 0
-        for run_i, (run_id, rows) in enumerate(by_run.items()):
-            start = idx
-            for r in rows:
-                def num(v):
-                    try:
-                        return float(v)
-                    except (TypeError, ValueError):
-                        return None
-                ct = num(r.get("cpu_temp_c")); gt = num(r.get("gpu_temp_c"))
-                cu = num(r.get("cpu_usage_pct")); gu = num(r.get("gpu_usage_pct"))
-                ru = num(r.get("ram_usage_pct"))
-                if ct is not None:
-                    temp_cpu_x.append(idx); temp_cpu_y.append(ct)
-                if gt is not None:
-                    temp_gpu_x.append(idx); temp_gpu_y.append(gt)
-                if cu is not None:
-                    use_cpu_x.append(idx); use_cpu_y.append(cu)
-                if gu is not None:
-                    use_gpu_x.append(idx); use_gpu_y.append(gu)
-                if ru is not None:
-                    use_ram_x.append(idx); use_ram_y.append(ru)
-                idx += 1
-            end = max(idx - 1, start)
-            color = self._run_color(run_i)
-            shapes.append({"type": "rect", "xref": "x", "yref": "paper",
-                           "x0": start - 0.5, "x1": end + 0.5, "y0": 0, "y1": 1,
-                           "fillcolor": color, "opacity": 0.12, "line": {"width": 0},
-                           "layer": "below"})
-            run_spans.append({"run_id": run_id, "x0": start, "x1": end,
-                              "color": color})
-
-        temp_traces = [
-            {"x": temp_cpu_x, "y": temp_cpu_y, "name": "CPU temp (C)",
-             "mode": "lines+markers", "line": {"color": "#e2510f"}},
-            {"x": temp_gpu_x, "y": temp_gpu_y, "name": "GPU temp (C)",
-             "mode": "lines+markers", "line": {"color": "#4aa3df"}},
-        ]
-        usage_traces = [
-            {"x": use_cpu_x, "y": use_cpu_y, "name": "CPU %",
-             "mode": "lines+markers", "line": {"color": "#e2510f"}},
-            {"x": use_gpu_x, "y": use_gpu_y, "name": "GPU %",
-             "mode": "lines+markers", "line": {"color": "#4aa3df"}},
-            {"x": use_ram_x, "y": use_ram_y, "name": "RAM %",
-             "mode": "lines+markers", "line": {"color": "#3fbf6f"}},
-        ]
-        return temp_traces, usage_traces, shapes, run_spans
-
-    def _per_run_payload(self, summary, runs_dir: Path):
-        """Build per-run tprof/ebath series for the per-run tab."""
-        out = []
-        for r in summary:
-            run_id = r["run_id"]
-            entry = {
-                "run_id": run_id, "status": r["status"],
-                "material": r.get("material", ""),
-                "potential": r.get("potential", ""),
-                "configuration": r.get("configuration", ""),
-                "structure": r.get("structure", ""),
-                "seed": r.get("seed", ""),
-                "duration_sec": r.get("duration_sec", ""),
-                "tprof": None, "ebath": None,
-            }
-            if r["status"] == "OK":
-                rd = runs_dir / run_id
-                # ebath series
-                ep = rd / "ELECTRON-BATH.csv"
-                if ep.exists():
-                    try:
-                        with open(ep) as fh:
-                            rows = list(csv.DictReader(fh))
-                        entry["ebath"] = {
-                            "t": [float(x["t_ps"]) for x in rows],
-                            "hot": [float(x["E_hot_eV"]) for x in rows],
-                            "cold": [float(x["E_cold_eV"]) for x in rows],
-                        }
-                    except Exception:
-                        pass
-                # tprof: last timestep's profile (temp vs coord)
-                tp = rd / "TEMP-PROFILE.csv"
-                if tp.exists():
-                    try:
-                        with open(tp) as fh:
-                            rows = list(csv.DictReader(fh))
-                        if rows:
-                            last_ts = max(int(x["timestep"]) for x in rows)
-                            prof = [x for x in rows
-                                    if int(x["timestep"]) == last_ts
-                                    and x["temperature"] != ""]
-                            entry["tprof"] = {
-                                "coord": [float(x["coord"]) for x in prof],
-                                "temp": [float(x["temperature"]) for x in prof],
-                                "timestep": last_ts,
-                            }
-                    except Exception:
-                        pass
-            out.append(entry)
-        return out
-
-    def _build_png_graphs(self, session_dir, session_id, summary, hw_csv, n_ok):
-        """Backup PNG graphs via matplotlib (best-effort)."""
-        try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-        except Exception:
-            self.log_line("Report: matplotlib/numpy not available - skipping PNGs.")
-            return
-        if n_ok == 0:
-            self.log_line("Report: no successful runs - skipping PNGs.")
-            return
-        graphs_dir = session_dir / "GRAPHS"
-        graphs_dir.mkdir(parents=True, exist_ok=True)
-        # HW usage over probe index
-        try:
-            with open(hw_csv) as fh:
-                rows = list(csv.DictReader(fh))
-            xs = list(range(len(rows)))
-            def col(name):
-                out = []
-                for r in rows:
-                    try:
-                        out.append(float(r[name]))
-                    except (TypeError, ValueError):
-                        out.append(float("nan"))
-                return out
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.plot(xs, col("cpu_usage_pct"), label="CPU %")
-            ax.plot(xs, col("gpu_usage_pct"), label="GPU %")
-            ax.plot(xs, col("ram_usage_pct"), label="RAM %")
-            ax.set_xlabel("probe #"); ax.set_ylabel("%"); ax.legend()
-            ax.set_title(f"Session {session_id} - resource usage")
-            fig.tight_layout()
-            fig.savefig(graphs_dir / f"HW-USAGE_{session_id}.png", dpi=110)
-            plt.close(fig)
-            self.log_line(f"PNG -> {graphs_dir / f'HW-USAGE_{session_id}.png'}")
-        except Exception as e:
-            self.log_line(f"Report: PNG HW graph failed ({e})")
-
-    # -- HTML templates ----------------------------------------------------
-    def _fmt_duration(self, secs):
-        try:
-            return fmt_hms(float(secs))
-        except Exception:
-            return "unknown"
-
-    def _hw_summary_cards(self, session_info):
-        """Return HTML for the hardware + timing overview cards."""
-        hw = session_info.get("hardware", {}) or {}
-        start = session_info.get("start_utc") or "-"
-        end = session_info.get("end_utc") or "-"
-        dur = self._fmt_duration(session_info.get("duration_sec"))
-        gpu = hw.get("gpu_model") or "none detected"
-        vram = hw.get("gpu_vram_mb")
-        gpu_line = gpu + (f" ({vram} MB VRAM)" if vram else "")
-        cpu = hw.get("cpu_model") or "unknown"
-        cores_p = hw.get("cpu_cores_physical")
-        cores_l = hw.get("cpu_cores_logical")
-        cores = (f"{cores_p} physical / {cores_l} logical"
-                 if cores_p or cores_l else "unknown")
-        ram = hw.get("ram_total_gb")
-        ram_line = f"{ram} GB" if ram else "unknown"
-
-        def card(label, value):
-            return (f'<div class="card"><div class="card-label">{label}</div>'
-                    f'<div class="card-value">{value}</div></div>')
-
-        return "\n".join([
-            card("Started (UTC)", start),
-            card("Ended (UTC)", end),
-            card("Duration", dur),
-            card("CPU", cpu),
-            card("CPU cores", cores),
-            card("RAM", ram_line),
-            card("GPU", gpu_line),
-            card("Platform", hw.get("platform") or "unknown"),
-        ])
-
-    def _html_no_data(self, session_id, n_fail, n_abort, session_info=None):
-        session_info = session_info or {}
-        cards = self._hw_summary_cards(session_info)
-        return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-<title>LAVA Report {session_id}</title>
-<style>
-body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
-background:#1a1210;color:#f3e9e3;margin:0;padding:0}}
-.wrap{{max-width:900px;margin:0 auto;padding:32px}}
-h1{{color:#ff7a1a;margin:0 0 4px}}
-.box{{background:#241a17;padding:28px;border-radius:12px;
-border:1px solid #e2510f;margin-top:20px}}
-.red{{color:#ff5a4d;font-weight:bold}}
-.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
-gap:12px;margin-top:20px}}
-.card{{background:#241a17;border:1px solid #3a2a24;border-radius:10px;padding:14px}}
-.card-label{{color:#b08a7a;font-size:11px;text-transform:uppercase;
-letter-spacing:.5px}}
-.card-value{{color:#f3e9e3;font-size:15px;margin-top:4px;word-break:break-word}}
-.footer{{color:#b08a7a;font-size:12px;margin-top:24px}}
-</style></head><body><div class="wrap">
-<h1>LAVA &mdash; Report not generated</h1>
-<div class="box"><p>This report was <span class="red">not generated</span>
-because {n_fail} run(s) failed and {n_abort} run(s) were aborted early, leaving
-insufficient successful data to visualize.</p>
-<p style="color:#b08a7a">Session {session_id}</p></div>
-<div class="cards">{cards}</div>
-<div class="footer">{FOOTER}</div>
-</div></body></html>"""
-
-    def _html_template(self, session_id, summary, n_ok, n_fail, n_abort,
-                       plotly_tag, data_json, session_info=None):
-        session_info = session_info or {}
-        cards = self._hw_summary_cards(session_info)
-
-        # summary table rows, colored by status
-        rows_html = []
-        for r in summary:
-            st = r["status"]
-            color = ("#3fbf6f" if st == "OK" else
-                     "#ff5a4d" if st == "FAILED" else "#f0b429")
-            rows_html.append(
-                f"<tr><td>{r['run_index']}</td>"
-                f"<td>{r.get('material','')}</td>"
-                f"<td>{r.get('potential','')}</td>"
-                f"<td>{r.get('configuration','')}</td>"
-                f"<td>{r.get('structure','')}</td>"
-                f"<td>{r.get('seed','')}</td>"
-                f"<td style='color:{color};font-weight:bold'>{st}</td>"
-                f"<td>{r.get('duration_sec','')}</td></tr>")
-        table = "\n".join(rows_html)
-
-        return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LAVA Report {session_id}</title>
-{plotly_tag}
-<style>
-*{{box-sizing:border-box}}
-body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
-background:#1a1210;color:#f3e9e3;margin:0;padding:0}}
-header{{background:linear-gradient(180deg,#2b1e19,#241a17);
-padding:20px 32px;border-bottom:2px solid #e2510f}}
-header h1{{color:#ff7a1a;margin:0;font-size:24px;letter-spacing:.5px}}
-header .sub{{color:#b08a7a;font-size:13px;margin-top:4px}}
-.status-pills span{{display:inline-block;padding:3px 12px;border-radius:12px;
-font-size:12px;font-weight:bold;margin-right:8px}}
-.wrap{{max-width:1180px;margin:0 auto;padding:24px 32px 48px}}
-.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));
-gap:12px;margin:20px 0}}
-.card{{background:#241a17;border:1px solid #3a2a24;border-radius:10px;
-padding:14px 16px}}
-.card-label{{color:#b08a7a;font-size:11px;text-transform:uppercase;
-letter-spacing:.5px}}
-.card-value{{color:#f3e9e3;font-size:15px;margin-top:5px;word-break:break-word}}
-.tabs{{display:flex;gap:6px;margin:24px 0 0;border-bottom:1px solid #3a2a24}}
-.tab{{padding:11px 22px;background:transparent;color:#b08a7a;cursor:pointer;
-border:none;font-size:14px;font-weight:600;border-bottom:3px solid transparent}}
-.tab:hover{{color:#f3e9e3}}
-.tab.active{{color:#ff7a1a;border-bottom-color:#e2510f}}
-.panel{{display:none;padding-top:20px}}.panel.active{{display:block}}
-.section-title{{color:#ff7a1a;font-size:16px;margin:22px 0 8px}}
-table{{border-collapse:collapse;width:100%;margin:10px 0;font-size:13px}}
-th,td{{border:1px solid #3a2a24;padding:8px 12px;text-align:left}}
-th{{background:#2b1e19;color:#ff7a1a;position:sticky;top:0}}
-tr:nth-child(even) td{{background:#211814}}
-.chart{{background:#241a17;border:1px solid #3a2a24;border-radius:10px;
-margin:12px 0;padding:10px;height:380px}}
-.chart.small{{height:320px}}
-.hint{{color:#b08a7a;font-size:12px;margin:6px 0 0}}
-#runsearch{{padding:10px 14px;width:min(420px,100%);background:#31231f;
-color:#f3e9e3;border:1px solid #3a2a24;border-radius:6px;font-size:14px}}
-.layout{{display:grid;grid-template-columns:320px 1fr;gap:18px;margin-top:14px}}
-@media(max-width:820px){{.layout{{grid-template-columns:1fr}}}}
-.runlist{{max-height:620px;overflow-y:auto;padding-right:4px}}
-.runitem{{padding:10px 12px;margin:6px 0;background:#241a17;border-radius:8px;
-cursor:pointer;border-left:4px solid #3fbf6f;transition:background .15s}}
-.runitem:hover{{background:#2b1e19}}
-.runitem.FAILED{{border-left-color:#ff5a4d}}
-.runitem.ABORTED_EARLY{{border-left-color:#f0b429}}
-.runitem .rid{{font-weight:bold;font-size:13px}}
-.runitem .meta{{color:#b08a7a;font-size:12px;margin-top:3px}}
-.badge{{padding:2px 9px;border-radius:10px;font-size:11px;font-weight:bold;
-float:right}}
-.detail-empty{{color:#b08a7a;padding:40px;text-align:center;
-background:#241a17;border-radius:10px;border:1px dashed #3a2a24}}
-.footer{{color:#b08a7a;padding:20px 32px;font-size:12px;
-border-top:1px solid #3a2a24;margin-top:24px}}
-</style></head><body>
-<header>
-<h1>&#x1F30B; LAVA Report</h1>
-<div class="sub">Session {session_id}</div>
-<div class="status-pills" style="margin-top:10px">
-<span style="background:#1e3a28;color:#3fbf6f">{n_ok} successful</span>
-<span style="background:#3a1e1e;color:#ff5a4d">{n_fail} failed</span>
-<span style="background:#3a331e;color:#f0b429">{n_abort} aborted</span>
-</div></header>
-
-<div class="wrap">
-<div class="cards">{cards}</div>
-
-<div class="tabs">
-<button class="tab active" data-tab="hw" onclick="showTab(this,'hw')">
-Hardware &amp; Session</button>
-<button class="tab" data-tab="runs" onclick="showTab(this,'runs')">
-Per-run Analysis</button>
-</div>
-
-<div id="hw" class="panel active">
-<div class="section-title">Run summary</div>
-<table><thead><tr><th>#</th><th>Material</th><th>Potential</th><th>Config</th>
-<th>Structure</th><th>Seed</th><th>Status</th><th>Duration (s)</th></tr></thead>
-<tbody>{table}</tbody></table>
-<div class="section-title">Temperatures over session</div>
-<div id="tempChart" class="chart"></div>
-<div class="section-title">Resource usage over session</div>
-<div id="useChart" class="chart"></div>
-<p class="hint">Colored bands mark each run's span along the timeline. Drag to
-zoom, double-click to reset, hover for values.</p>
-</div>
-
-<div id="runs" class="panel">
-<input id="runsearch" placeholder="Search runs by material, file, seed, or ID..."
- oninput="filterRuns()"/>
-<div class="layout">
-<div class="runlist" id="runlist"></div>
-<div id="rundetail"><div class="detail-empty">Select a run on the left to see
-its temperature profile and electron-bath energy.</div></div>
-</div>
-</div>
-</div>
-
-<div class="footer">{FOOTER}</div>
-
-<script>
-var DATA = {data_json};
-var DARK={{paper_bgcolor:'#241a17',plot_bgcolor:'#241a17',
-  font:{{color:'#f3e9e3'}},margin:{{t:30,r:20,b:45,l:55}},
-  legend:{{orientation:'h',y:1.12}}}};
-
-function showTab(btn,t){{
-  document.querySelectorAll('.tab').forEach(function(x){{x.classList.remove('active')}});
-  document.querySelectorAll('.panel').forEach(function(x){{x.classList.remove('active')}});
-  btn.classList.add('active');
-  document.getElementById(t).classList.add('active');
-  if(t==='hw'){{drawHW();}}
-  // charts drawn while hidden have 0 width; resize once visible
-  setTimeout(function(){{
-    ['tempChart','useChart','tprofC','ebathC'].forEach(function(id){{
-      var el=document.getElementById(id);
-      if(el && el.data){{Plotly.Plots.resize(el);}}
-    }});
-  }},50);
-}}
-
-var hwDrawn=false;
-function drawHW(){{
-  if(hwDrawn) return; hwDrawn=true;
-  var t=Object.assign({{}},DARK,{{shapes:DATA.hw_shapes,
-    xaxis:{{title:'probe #',gridcolor:'#3a2a24'}},
-    yaxis:{{title:'\\u00B0C',gridcolor:'#3a2a24'}}}});
-  Plotly.newPlot('tempChart',DATA.hw_temp,t,{{responsive:true,displaylogo:false}});
-  var u=Object.assign({{}},DARK,{{shapes:DATA.hw_shapes,
-    xaxis:{{title:'probe #',gridcolor:'#3a2a24'}},
-    yaxis:{{title:'%',gridcolor:'#3a2a24',range:[0,100]}}}});
-  Plotly.newPlot('useChart',DATA.hw_use,u,{{responsive:true,displaylogo:false}});
-}}
-
-function renderRunList(items){{
-  var el=document.getElementById('runlist'); el.innerHTML='';
-  if(!items.length){{el.innerHTML='<p class="hint">No runs match.</p>';return;}}
-  items.forEach(function(r){{
-    var c=(r.status==='OK'?'#3fbf6f':r.status==='FAILED'?'#ff5a4d':'#f0b429');
-    var d=document.createElement('div');
-    d.className='runitem '+r.status;
-    d.innerHTML='<span class="badge" style="background:'+c+';color:#1a1210">'+
-      r.status+'</span><div class="rid">'+r.run_id+'</div>'+
-      '<div class="meta">'+r.material+' &middot; '+(r.potential||'no potential')+
-      ' &middot; '+r.structure+' &middot; seed '+r.seed+'</div>';
-    d.onclick=function(){{showRun(r);}};
-    el.appendChild(d);
-  }});
-}}
-
-function showRun(r){{
-  var el=document.getElementById('rundetail');
-  if(r.status!=='OK'){{
-    var c=(r.status==='FAILED'?'#ff5a4d':'#f0b429');
-    el.innerHTML='<div class="detail-empty" style="color:'+c+'"><b>'+r.run_id+
-      '</b><br>'+r.status+' &mdash; no data available for this run.</div>';
-    return;
-  }}
-  el.innerHTML='<div class="section-title">'+r.run_id+'</div>'+
-    '<div id="tprofC" class="chart small"></div>'+
-    '<div id="ebathC" class="chart small"></div>';
-  if(r.tprof && r.tprof.coord && r.tprof.coord.length){{
-    Plotly.newPlot('tprofC',[{{x:r.tprof.coord,y:r.tprof.temp,
-      mode:'lines+markers',line:{{color:'#e2510f'}},marker:{{size:5}},
-      name:'T (K)'}}],
-      Object.assign({{}},DARK,{{title:'Temperature profile (t='+r.tprof.timestep+')',
-      xaxis:{{title:'position (reduced)',gridcolor:'#3a2a24'}},
-      yaxis:{{title:'T (K)',gridcolor:'#3a2a24'}}}}),
-      {{responsive:true,displaylogo:false}});
-  }} else {{
-    document.getElementById('tprofC').className='detail-empty';
-    document.getElementById('tprofC').innerHTML=
-      'No temperature-profile data &mdash; the run likely ended before the '+
-      'ave/chunk output interval was reached.';
-  }}
-  if(r.ebath && r.ebath.t && r.ebath.t.length){{
-    Plotly.newPlot('ebathC',[
-      {{x:r.ebath.t,y:r.ebath.hot,mode:'lines',name:'E_hot (eV)',
-        line:{{color:'#ff5a4d'}}}},
-      {{x:r.ebath.t,y:r.ebath.cold,mode:'lines',name:'E_cold (eV)',
-        line:{{color:'#4aa3df'}}}}],
-      Object.assign({{}},DARK,{{title:'Electron-bath energy',
-      xaxis:{{title:'t (ps)',gridcolor:'#3a2a24'}},
-      yaxis:{{title:'E (eV)',gridcolor:'#3a2a24'}}}}),
-      {{responsive:true,displaylogo:false}});
-  }} else {{
-    document.getElementById('ebathC').className='detail-empty';
-    document.getElementById('ebathC').innerHTML='No electron-bath data.';
-  }}
-}}
-
-function filterRuns(){{
-  var q=document.getElementById('runsearch').value.toLowerCase();
-  var items=DATA.per_run.filter(function(r){{
-    return (r.run_id+' '+r.material+' '+(r.potential||'')+' '+r.configuration+
-      ' '+r.structure+' '+r.seed).toLowerCase().indexOf(q)>=0;
-  }});
-  renderRunList(items);
-}}
-
-window.addEventListener('resize',function(){{
-  ['tempChart','useChart','tprofC','ebathC'].forEach(function(id){{
-    var el=document.getElementById(id);
-    if(el && el.data){{Plotly.Plots.resize(el);}}
-  }});
-}});
-
-drawHW();
-renderRunList(DATA.per_run);
-</script>
-</body></html>"""
+def _register_bundled_font_early(log=lambda *a: None):
+    """Copy the bundled Roboto Mono TTFs into the user font dir and refresh the
+    fontconfig cache BEFORE any Tk root exists, so the font is visible on the
+    very first launch (Tk reads the family list once at startup). Linux/WSL;
+    best-effort and silent on failure. Returns True if it copied anything new."""
+    try:
+        src_dir = Path(__file__).resolve().parent / "assets" / "fonts"
+        ttfs = sorted(src_dir.glob("*.ttf")) if src_dir.is_dir() else []
+        if not ttfs:
+            return False
+        dest = Path.home() / ".local" / "share" / "fonts" / "LAVA"
+        dest.mkdir(parents=True, exist_ok=True)
+        copied = False
+        for f in ttfs:
+            target = dest / f.name
+            if not target.exists():
+                shutil.copy2(f, target)
+                copied = True
+        if copied and shutil.which("fc-cache"):
+            subprocess.run(["fc-cache", "-f", str(dest)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=30)
+        return copied
+    except Exception:
+        return False
 
 
 def main():
+    # Register the bundled font before the Tk root exists so it applies on the
+    # first launch, not the second.
+    _register_bundled_font_early()
     root = tk.Tk()
     App(root)
     root.mainloop()

@@ -1,0 +1,30 @@
+{
+  "pipeline": 1,
+  "app_version": "0.4.0",
+  "created": "2026-09-01T13:27:56",
+  "project_root": "/home/userx/Documents/GITLAB/LAVA-PROJECT/LAVA_LAMMPS-Automation-Validation-Aid",
+  "lammps_bin": "/home/userx/.lammps-build/build/lmp",
+  "seeds": [
+    1
+  ],
+  "materials_root": "/home/userx/Documents/GITLAB/LAVA-PROJECT/LAVA_LAMMPS-Automation-Validation-Aid/SIMULATION/MATERIALS",
+  "materials": {
+    "ZincOxide": {
+      "potentials": [],
+      "configs": [
+        "in.zno_kappa"
+      ],
+      "structures": [
+        "zno_L20.data",
+        "zno_L30.data",
+        "zno_L40.data"
+      ]
+    }
+  },
+  "untested_materials": {},
+  "paths": {
+    "sessions": "/home/userx/Documents/GITLAB/LAVA-PROJECT/LAVA_LAMMPS-Automation-Validation-Aid/ANALYSIS/SESSIONS",
+    "logs": "/home/userx/Documents/GITLAB/LAVA-PROJECT/LAVA_LAMMPS-Automation-Validation-Aid/LOGS",
+    "temp": "/home/userx/Documents/GITLAB/LAVA-PROJECT/LAVA_LAMMPS-Automation-Validation-Aid/TEMP"
+  }
+}

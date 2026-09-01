@@ -1,0 +1,2 @@
+run_index,run_id,material,status,potential,structure,configuration,seed,start_time,end_time,duration_sec,exit_code,avg_gpu_usage_pct,avg_cpu_usage_pct,avg_gpu_temp_c,avg_cpu_temp_c,avg_ram_usage_pct
+1,[ABORTED]-RUN-0001-20260901063559Z,BlackPhosphorus,ABORTED_EARLY,bp.sw,bp_ac_W16_L33.data,in.bp_armchair,1,2026-09-01T12:35:59,2026-09-01T12:50:44,885.17,ABORTED_EARLY,,26.61,,55.27,76.23
