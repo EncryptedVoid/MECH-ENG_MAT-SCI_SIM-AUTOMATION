@@ -73,7 +73,7 @@ double-clicks and one reboot — after that, it's permanently one double-click. 
 LAVA will also ask for your password once when it builds LAMMPS; that's the same Ubuntu
 password, used only to install what the build needs.)
 
-### Linux
+### Linux (or WSL if already installed and setup with Ubuntu)
 
 1. Open a terminal.
 2. Paste this and press Enter:
